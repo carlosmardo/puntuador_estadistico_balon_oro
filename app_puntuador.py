@@ -21,8 +21,8 @@ st.set_page_config(
     layout="wide",
 )
 
-DATASET_PATH = Path("data/dataset_ml_base.csv")
-OUTPUT_DIR = Path("data/puntuador")
+DATASET_PATH = Path("dataset_ml_base.csv")
+OUTPUT_DIR = Path("puntuador")
 WEIGHTS_PATH = OUTPUT_DIR / "pesos_puntuador.json"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -860,7 +860,7 @@ def comparison_tab(raw_df: pd.DataFrame, season: str, ranking: pd.DataFrame, det
 
 if not DATASET_PATH.exists():
     st.error(
-        f"No se encuentra `{DATASET_PATH}`. Guarda `dataset_ml_base.csv` en la carpeta `data/` "
+        f"No se encuentra `{DATASET_PATH}`."
         "del proyecto y vuelve a ejecutar Streamlit."
     )
     st.stop()
