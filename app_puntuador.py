@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import copy
+import hashlib
 import re
 import unicodedata
 from html import escape as html_escape
@@ -291,8 +292,8 @@ def clean_columns(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner="Cargando y preparando el dataset...")
-def load_dataset(path_string: str, file_mtime: float) -> pd.DataFrame:
-    del file_mtime  # forma parte de la clave de caché para detectar cambios del archivo
+def load_dataset(path_string: str, file_version: str) -> pd.DataFrame:
+    del file_version  # forma parte de la clave de caché para detectar cambios del archivo
     path = Path(path_string)
     if not path.exists():
         raise FileNotFoundError(f"No se encuentra el dataset: {path}")
@@ -618,24 +619,21 @@ def weight_configs_for_season(season: str) -> tuple[dict[str, dict[str, float]],
     )
 
 
-def apply_weight_inputs(season: str, positions: list[str], stats: list[str], competitions: list[str]) -> None:
-    """Callback del formulario: aplica todos los spin buttons de la temporada activa."""
+def apply_weight_inputs(season: str, position: str, stats: list[str], competitions: list[str]) -> None:
+    """Aplica los spin buttons de una única posición para reducir widgets por rerun."""
     configs = copy.deepcopy(st.session_state["puntuador_weight_configs"])
     stat_season = configs["stat_weights_by_season"].setdefault(season, {})
     comp_season = configs["competition_weights_by_season"].setdefault(season, {})
-
-    for position in positions:
-        allowed = stats_allowed_for_position(position, stats)
-        stat_season.setdefault(position, {})
-        comp_season.setdefault(position, {})
-        for stat in allowed:
-            key = stat_weight_widget_key(season, position, stat)
-            old_value = stat_season[position].get(stat, 1.0)
-            stat_season[position][stat] = clamp_weight(st.session_state.get(key, old_value))
-        for competition in competitions:
-            key = competition_weight_widget_key(season, position, competition)
-            old_value = comp_season[position].get(competition, 1.0)
-            comp_season[position][competition] = clamp_weight(st.session_state.get(key, old_value))
+    stat_season.setdefault(position, {})
+    comp_season.setdefault(position, {})
+    for stat in stats_allowed_for_position(position, stats):
+        key = stat_weight_widget_key(season, position, stat)
+        old_value = stat_season[position].get(stat, 1.0)
+        stat_season[position][stat] = clamp_weight(st.session_state.get(key, old_value))
+    for competition in competitions:
+        key = competition_weight_widget_key(season, position, competition)
+        old_value = comp_season[position].get(competition, 1.0)
+        comp_season[position][competition] = clamp_weight(st.session_state.get(key, old_value))
 
     st.session_state["puntuador_weight_configs"] = configs
     autosave_weight_configs(configs)
@@ -685,7 +683,6 @@ def reset_season_weights(season: str, positions: list[str], stats: list[str], co
     st.session_state["puntuador_weights_applied_notice"] = season
 
 
-@st.cache_data(show_spinner=False, max_entries=12)
 def calculate_ranking(
     zdata: pd.DataFrame,
     season: str,
@@ -693,17 +690,19 @@ def calculate_ranking(
     positions: list[str],
     stat_weights: dict[str, dict[str, float]],
     comp_weights: dict[str, dict[str, float]],
+    include_detail: bool = False,
 ):
-    """Calcula el ranking vectorizando por pareja competición/posición.
+    """Calcula el ranking mediante grupos vectorizados por competición y posición.
 
-    El resultado numérico es el mismo que la versión anterior, pero evita filtrar
-    todo el dataset repetidamente para cada jugador y para cada competición.
+    Por defecto solo calcula las puntuaciones. El desglose completo por estadística
+    se genera únicamente cuando se solicita expresamente para descargarlo.
     """
     season_data = zdata.loc[zdata["temporada"].eq(season)].copy().reset_index(drop=True)
     if season_data.empty:
         return pd.DataFrame(), pd.DataFrame()
 
-    season_data["__player_key"] = season_data["nombre"].map(fold_text)
+    if "__player_key" not in season_data.columns:
+        season_data["__player_key"] = season_data["nombre"].map(fold_text)
     identity_cols = [
         c for c in ["temporada", "nombre", "club", "posicion", "nacionalidad", "posicion_balon_oro"]
         if c in season_data.columns
@@ -713,20 +712,15 @@ def calculate_ranking(
     score_by_player: dict[str, float] = {}
     detail_parts: list[pd.DataFrame] = []
 
-    # Cada grupo corresponde a una competición individual y una posición.
-    grouped = season_data.groupby(["competicion", "posicion"], sort=False, dropna=False).groups
+    grouped = season_data.groupby(["competicion", "posicion"], sort=False, dropna=False).indices
     for (competition, position), row_indices in grouped.items():
         competition = str(competition)
         position = str(position)
-        group_idx = np.asarray(list(row_indices), dtype=int)
-        sub = season_data.loc[group_idx].reset_index(drop=True)
+        sub = season_data.iloc[np.asarray(row_indices, dtype=int)].reset_index(drop=True)
         allowed_stats = stats_allowed_for_position(position, model_stats)
         if not allowed_stats:
             continue
 
-        # Una variable está activa si existen valores observados para esa posición
-        # en esa competición. La máscara y el denominador son constantes para todos
-        # los jugadores del grupo, por lo que se calculan una sola vez.
         active_stats = [
             stat for stat in allowed_stats
             if stat in sub.columns and pd.to_numeric(sub[stat], errors="coerce").notna().any()
@@ -741,10 +735,11 @@ def calculate_ranking(
         denominator = float(stat_weight_vector[active_mask].sum()) if active_mask.any() else 0.0
         signs = np.asarray([stat_sign(stat) for stat in allowed_stats], dtype=np.float64)
         z_columns = [f"z__{stat}" for stat in allowed_stats]
-        z_frame = pd.DataFrame(index=sub.index)
-        for stat, z_col in zip(allowed_stats, z_columns):
-            z_frame[stat] = pd.to_numeric(sub[z_col], errors="coerce").fillna(0.0) if z_col in sub else 0.0
-        z_matrix = z_frame[allowed_stats].to_numpy(dtype=np.float64, copy=True)
+        z_matrix = np.column_stack([
+            pd.to_numeric(sub[z_col], errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
+            if z_col in sub.columns else np.zeros(len(sub), dtype=np.float64)
+            for z_col in z_columns
+        ])
 
         if denominator > 1e-12:
             contributions_before_comp = (
@@ -757,36 +752,35 @@ def calculate_ranking(
         competition_scores = contributions_before_comp.sum(axis=1)
         comp_weight = max(0.0, float(comp_weights.get(position, {}).get(competition, 1.0)))
         competition_contributions = competition_scores * comp_weight
-        sub_keys = sub["__player_key"].astype(str)
         group_scores = pd.DataFrame({
-            "__player_key": sub_keys.to_numpy(),
+            "__player_key": sub["__player_key"].astype(str).to_numpy(),
             "score": competition_contributions,
         }).groupby("__player_key", sort=False)["score"].sum()
         for player_key, player_score in group_scores.items():
             score_by_player[player_key] = score_by_player.get(player_key, 0.0) + float(player_score)
 
-        # Prepara el desglose de contribuciones por estadística usando matrices
-        # NumPy, en vez de crear una fila desde cero para cada jugador individual.
-        raw_matrix = np.column_stack([
-            sub[stat].to_numpy() if stat in sub.columns else np.full(len(sub), np.nan)
-            for stat in allowed_stats
-        ])
-        for stat_idx, stat in enumerate(allowed_stats):
+        if include_detail:
+            n_rows, n_stats = z_matrix.shape
+            raw_matrix = np.column_stack([
+                pd.to_numeric(sub[stat], errors="coerce").to_numpy(dtype=np.float64)
+                if stat in sub.columns else np.full(n_rows, np.nan, dtype=np.float64)
+                for stat in allowed_stats
+            ])
             detail_parts.append(pd.DataFrame({
                 "temporada": season,
-                "nombre": sub["nombre"].astype(str).to_numpy(),
+                "nombre": np.repeat(sub["nombre"].astype(str).to_numpy(), n_stats),
                 "posicion": position,
                 "competicion": competition,
-                "estadistica": stat,
-                "valor_agregado": raw_matrix[:, stat_idx],
-                "zscore": z_matrix[:, stat_idx],
-                "orientacion": "Negativa" if signs[stat_idx] < 0 else "Positiva",
-                "peso_estadistica": stat_weight_vector[stat_idx],
-                "contribucion_antes_peso_competicion": contributions_before_comp[:, stat_idx],
+                "estadistica": np.tile(np.asarray(allowed_stats, dtype=object), n_rows),
+                "valor_agregado": raw_matrix.reshape(-1),
+                "zscore": z_matrix.reshape(-1),
+                "orientacion": np.tile(np.where(signs < 0, "Negativa", "Positiva"), n_rows),
+                "peso_estadistica": np.tile(stat_weight_vector, n_rows),
+                "contribucion_antes_peso_competicion": contributions_before_comp.reshape(-1),
                 "peso_competicion": comp_weight,
-                "puntuacion_competicion": competition_scores,
-                "contribucion_competicion": competition_contributions,
-                "contribucion_final": contributions_before_comp[:, stat_idx] * comp_weight,
+                "puntuacion_competicion": np.repeat(competition_scores, n_stats),
+                "contribucion_competicion": np.repeat(competition_contributions, n_stats),
+                "contribucion_final": (contributions_before_comp * comp_weight).reshape(-1),
             }))
 
     candidates["score_puntuacion"] = candidates["__player_key"].map(score_by_player).fillna(0.0)
@@ -805,13 +799,156 @@ def calculate_ranking(
     return candidates, detail_df
 
 
+def weight_signature(stat_weights: dict, comp_weights: dict) -> str:
+    """Firma compacta para reutilizar rankings cuando no cambian los pesos."""
+    payload = json.dumps(
+        {"stats": stat_weights, "competitions": comp_weights},
+        sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+    )
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+def get_cached_ranking(
+    zdata: pd.DataFrame,
+    season: str,
+    model_stats: list[str],
+    positions: list[str],
+    stat_weights: dict,
+    comp_weights: dict,
+    data_signature: str,
+) -> pd.DataFrame:
+    """Caché por sesión: evita volver a hashear el DataFrame completo en cada rerun."""
+    cache = st.session_state.setdefault("puntuador_ranking_cache", {})
+    key = (data_signature, season, weight_signature(stat_weights, comp_weights))
+    if key not in cache:
+        ranking, _ = calculate_ranking(
+            zdata, season, model_stats, positions, stat_weights, comp_weights, include_detail=False
+        )
+        cache[key] = ranking
+        while len(cache) > 8:
+            cache.pop(next(iter(cache)))
+    return cache[key]
+
+
+def calculate_player_score_detail(
+    zdata: pd.DataFrame,
+    season: str,
+    player_name: str,
+    model_stats: list[str],
+    stat_weights: dict[str, dict[str, float]],
+    comp_weights: dict[str, dict[str, float]],
+) -> pd.DataFrame:
+    """Desglose de contribuciones de un jugador; no calcula detalles de todo el ranking."""
+    season_data = zdata.loc[zdata["temporada"].eq(season)].copy()
+    if season_data.empty:
+        return pd.DataFrame()
+    if "__player_key" not in season_data.columns:
+        season_data["__player_key"] = season_data["nombre"].map(fold_text)
+    player_key = fold_text(player_name)
+    player_rows = season_data.loc[season_data["__player_key"].eq(player_key)]
+    if player_rows.empty:
+        return pd.DataFrame()
+
+    # Índice de población para identificar variables observadas por competición y posición.
+    populations = {
+        (str(comp), str(pos)): group
+        for (comp, pos), group in season_data.groupby(["competicion", "posicion"], sort=False, dropna=False)
+    }
+    detail_rows = []
+    for row in player_rows.itertuples(index=False):
+        row_data = row._asdict()
+        competition = str(row_data.get("competicion", ""))
+        position = str(row_data.get("posicion", ""))
+        allowed_stats = stats_allowed_for_position(position, model_stats)
+        population = populations.get((competition, position))
+        if population is None or not allowed_stats:
+            continue
+        active_stats = [
+            stat for stat in allowed_stats
+            if stat in population.columns and pd.to_numeric(population[stat], errors="coerce").notna().any()
+        ]
+        active = set(active_stats)
+        weights = stat_weights.get(position, {})
+        denominator = sum(max(0.0, float(weights.get(stat, 1.0))) for stat in active_stats)
+        comp_weight = max(0.0, float(comp_weights.get(position, {}).get(competition, 1.0)))
+        contributions = []
+        stat_values = []
+        for stat in allowed_stats:
+            try:
+                weight = max(0.0, float(weights.get(stat, 1.0)))
+            except (TypeError, ValueError):
+                weight = 1.0
+            sign = stat_sign(stat)
+            z_value = row_data.get(f"z__{stat}", 0.0)
+            z_value = float(z_value) if pd.notna(z_value) and np.isfinite(float(z_value)) else 0.0
+            raw_value = row_data.get(stat, np.nan)
+            contribution = sign * z_value * weight / denominator if denominator > 1e-12 and stat in active else 0.0
+            contributions.append(contribution)
+            stat_values.append({
+                "temporada": season,
+                "nombre": player_name,
+                "posicion": position,
+                "competicion": competition,
+                "estadistica": stat,
+                "valor_agregado": raw_value,
+                "zscore": z_value,
+                "orientacion": "Negativa" if sign < 0 else "Positiva",
+                "peso_estadistica": weight,
+                "contribucion_antes_peso_competicion": contribution,
+            })
+        competition_score = float(sum(contributions))
+        competition_contribution = competition_score * comp_weight
+        for item in stat_values:
+            item["peso_competicion"] = comp_weight
+            item["puntuacion_competicion"] = competition_score
+            item["contribucion_competicion"] = competition_contribution
+            item["contribucion_final"] = item["contribucion_antes_peso_competicion"] * comp_weight
+        detail_rows.extend(stat_values)
+    return pd.DataFrame(detail_rows)
+
+
+def get_cached_player_detail(
+    zdata: pd.DataFrame,
+    season: str,
+    player_name: str,
+    model_stats: list[str],
+    stat_weights: dict,
+    comp_weights: dict,
+    data_signature: str,
+) -> pd.DataFrame:
+    cache = st.session_state.setdefault("puntuador_player_detail_cache", {})
+    key = (data_signature, season, fold_text(player_name), weight_signature(stat_weights, comp_weights))
+    if key not in cache:
+        cache[key] = calculate_player_score_detail(
+            zdata, season, player_name, model_stats, stat_weights, comp_weights
+        )
+        while len(cache) > 24:
+            cache.pop(next(iter(cache)))
+    return cache[key]
+
+
 # ============================================================
 # ESTADÍSTICAS DE FICHA Y COMPARADOR
 # ============================================================
 
 def find_player_rows(raw_df: pd.DataFrame, season: str, name: str) -> pd.DataFrame:
+    """Busca por un índice creado al cargar el dataset, evitando recorrerlo entero."""
+    lookup = st.session_state.get("puntuador_raw_row_indices", {})
+    indices = lookup.get((season, fold_text(name)))
+    if indices is not None:
+        return raw_df.iloc[indices].copy()
     mask = raw_df["temporada"].eq(season) & raw_df["nombre"].map(fold_text).eq(fold_text(name))
     return raw_df.loc[mask].copy()
+
+
+def find_player_comp_rows(player_comp: pd.DataFrame, season: str, name: str) -> pd.DataFrame:
+    """Busca la tabla ya agregada a jugador-temporada-competición."""
+    lookup = st.session_state.get("puntuador_comp_row_indices", {})
+    indices = lookup.get((season, fold_text(name)))
+    if indices is not None:
+        return player_comp.iloc[indices].copy()
+    mask = player_comp["temporada"].eq(season) & player_comp["nombre"].map(fold_text).eq(fold_text(name))
+    return player_comp.loc[mask].copy()
 
 
 def safe_num_sum(rows: pd.DataFrame, column: str):
@@ -906,19 +1043,15 @@ def show_player_detail(raw_df: pd.DataFrame, season: str, name: str, detail_df: 
     with tabs[0]:
         st.caption("Los porcentajes se recalculan con numeradores y denominadores agregados; resultado_competicion se muestra por torneo.")
         display_stats_table(rows, f"Estadísticas globales · {name}", f"{key_prefix}_global")
-        player_detail = detail_df[detail_df["nombre"].map(fold_text).eq(fold_text(name))] if not detail_df.empty else pd.DataFrame()
-        if not player_detail.empty:
-            comp_score = player_detail[["competicion", "peso_competicion", "puntuacion_competicion", "contribucion_competicion"]].drop_duplicates()
+        if not detail_df.empty:
+            comp_score = detail_df[["competicion", "peso_competicion", "puntuacion_competicion", "contribucion_competicion"]].drop_duplicates()
             st.markdown("**Contribución de cada competición a la puntuación**")
             st.dataframe(comp_score.sort_values("contribucion_competicion", ascending=False), use_container_width=True, hide_index=True)
     for idx, competition in enumerate(competitions, start=1):
         with tabs[idx]:
             subset = rows[rows["competicion"].astype(str).eq(competition)]
             display_stats_table(subset, f"Estadísticas · {competition}", f"{key_prefix}_comp_{idx}")
-            player_comp_detail = detail_df[
-                detail_df["nombre"].map(fold_text).eq(fold_text(name))
-                & detail_df["competicion"].eq(competition)
-            ] if not detail_df.empty else pd.DataFrame()
+            player_comp_detail = detail_df[detail_df["competicion"].eq(competition)] if not detail_df.empty else pd.DataFrame()
             if not player_comp_detail.empty:
                 detail_cols = [
                     "estadistica", "valor_agregado", "zscore", "orientacion", "peso_estadistica", "contribucion_final"
@@ -932,7 +1065,22 @@ def show_player_detail(raw_df: pd.DataFrame, season: str, name: str, detail_df: 
                 st.dataframe(shown, use_container_width=True, hide_index=True)
 
 
-def show_ranking_cards(ranking: pd.DataFrame, raw_df: pd.DataFrame, detail_df: pd.DataFrame, season: str):
+def toggle_player_profile(season: str, player_key: str) -> None:
+    """Abre o cierra la ficha solicitada antes del rerun, sin renderizar fichas anteriores."""
+    state_key = f"puntuador_open_profile::{season}"
+    st.session_state[state_key] = None if st.session_state.get(state_key) == player_key else player_key
+
+
+def show_ranking_cards(
+    ranking: pd.DataFrame,
+    raw_df: pd.DataFrame,
+    zdata: pd.DataFrame,
+    season: str,
+    model_stats: list[str],
+    stat_weights: dict,
+    comp_weights: dict,
+    data_signature: str,
+):
     if ranking.empty:
         st.warning("No hay candidatos disponibles para esta temporada.")
         return
@@ -947,14 +1095,19 @@ def show_ranking_cards(ranking: pd.DataFrame, raw_df: pd.DataFrame, detail_df: p
         filtered = filtered[match]
     st.caption(f"Mostrando {len(filtered):,} jugadores · temporada {season}".replace(",", "."))
 
-    for _, row in filtered.iterrows():
-        rank = "—" if pd.isna(row.get("posicion_predicha")) else str(int(row["posicion_predicha"]))
-        actual_value = row.get("posicion_real", np.nan)
+    opened_key = f"puntuador_open_profile::{season}"
+    opened_player = st.session_state.get(opened_key)
+    for row in filtered.itertuples(index=False):
+        row_dict = row._asdict()
+        rank_value = row_dict.get("posicion_predicha", np.nan)
+        actual_value = row_dict.get("posicion_real", np.nan)
+        rank = "—" if pd.isna(rank_value) else str(int(rank_value))
         actual = "—" if pd.isna(actual_value) else str(int(actual_value))
-        name = html_escape(str(row.get("nombre", "Jugador desconocido")))
-        club = html_escape(str(row.get("club", "—") or "—"))
-        position = html_escape(str(row.get("posicion", "—") or "—"))
-        score = float(row.get("score_puntuacion", 0.0))
+        raw_name = str(row_dict.get("nombre", "Jugador desconocido"))
+        name = html_escape(raw_name)
+        club = html_escape(str(row_dict.get("club", "—") or "—"))
+        position = html_escape(str(row_dict.get("posicion", "—") or "—"))
+        score = float(row_dict.get("score_puntuacion", 0.0))
         card = f"""
         <div class="ranking-card">
           <div class="ranking-card-top">
@@ -966,17 +1119,37 @@ def show_ranking_cards(ranking: pd.DataFrame, raw_df: pd.DataFrame, detail_df: p
         </div>
         """
         st.markdown(card, unsafe_allow_html=True)
-        with st.expander(f"📊 Ver estadísticas · {name}", expanded=False):
-            show_player_detail(raw_df, season, name, detail_df, f"detail_{season}_{safe_filename(name)}")
+        player_key = fold_text(raw_name)
+        button_label = "🙈 Ocultar estadísticas" if opened_player == player_key else "📊 Ver estadísticas"
+        st.button(
+            button_label,
+            key=f"profile_btn_{safe_filename(season)}_{safe_filename(raw_name)}_{rank}",
+            on_click=toggle_player_profile,
+            args=(season, player_key),
+        )
+
+        # Solo se genera/renderiza la ficha abierta. Los otros acordeones no procesan
+        # sus estadísticas en cada rerun, lo que reduce mucho el coste del ranking.
+        if st.session_state.get(opened_key) == player_key:
+            with st.expander(f"Estadísticas de {raw_name}", expanded=True):
+                player_detail = get_cached_player_detail(
+                    zdata, season, raw_name, model_stats, stat_weights, comp_weights, data_signature
+                )
+                show_player_detail(raw_df, season, raw_name, player_detail, f"detail_{season}_{safe_filename(raw_name)}")
 
 
-def comparison_tab(raw_df: pd.DataFrame, season: str, ranking: pd.DataFrame, detail_df: pd.DataFrame):
+def comparison_tab(
+    raw_df: pd.DataFrame,
+    player_comp: pd.DataFrame,
+    season: str,
+    ranking: pd.DataFrame,
+):
     st.subheader("Comparador de jugadores")
-    season_rows = raw_df[raw_df["temporada"].eq(season)]
+    season_rows = raw_df.loc[raw_df["temporada"].eq(season), ["nombre", "club", "posicion"]]
     if season_rows.empty:
         st.info("No hay datos para esta temporada.")
         return
-    players = season_rows[["nombre", "club", "posicion"]].drop_duplicates("nombre").copy()
+    players = season_rows.drop_duplicates("nombre").copy()
     players["club"] = players["club"].replace("", "Club desconocido")
     players["label"] = players["nombre"].astype(str) + " — " + players["club"].astype(str) + " (" + players["posicion"].astype(str) + ")"
     labels = players["label"].tolist()
@@ -988,15 +1161,18 @@ def comparison_tab(raw_df: pd.DataFrame, season: str, ranking: pd.DataFrame, det
     player_map = dict(zip(players["label"], players["nombre"]))
     output = []
     players_rows: dict[str, pd.DataFrame] = {}
+    player_comp_frames: dict[str, pd.DataFrame] = {}
     for label in chosen:
         name = player_map[label]
-        rows = find_player_rows(raw_df, season, name)
-        players_rows[label] = rows
-        vals = aggregate_display_stats(rows)
+        raw_rows = find_player_rows(raw_df, season, name)
+        stat_rows = find_player_comp_rows(player_comp, season, name)
+        players_rows[label] = raw_rows
+        player_comp_frames[label] = stat_rows
+        vals = aggregate_display_stats(stat_rows if not stat_rows.empty else raw_rows)
         item = {"Jugador": label}
         item.update({stat: value for stat, value in vals.items() if pd.notna(value)})
-        if "resultado_competicion" in rows.columns:
-            results = rows[["competicion", "resultado_competicion"]].dropna().drop_duplicates()
+        if "resultado_competicion" in raw_rows.columns:
+            results = raw_rows[["competicion", "resultado_competicion"]].dropna().drop_duplicates()
             item["resultado_competicion"] = " · ".join(
                 f"{r.competicion}: {r.resultado_competicion}" for r in results.itertuples(index=False)
             ) or "—"
@@ -1018,22 +1194,24 @@ def comparison_tab(raw_df: pd.DataFrame, season: str, ranking: pd.DataFrame, det
             f"comparacion_global_{season.replace('/', '-')}.csv", "text/csv", key=f"cmp_dl_{season}"
         )
 
-    competitions = sorted({str(comp) for player_frame in players_rows.values() for comp in player_frame["competicion"].dropna().unique()})
+    competitions = sorted({str(comp) for player_frame in player_comp_frames.values() for comp in player_frame.get("competicion", pd.Series(dtype=str)).dropna().unique()})
     selected_competitions = st.multiselect(
-        "Competiciones individuales", competitions, default=competitions, key=f"compare_comps_{season}"
+        "Competiciones individuales", competitions, default=[], key=f"compare_comps_{season}",
+        help="Selecciona solo las competiciones que quieras comparar. Se dejan sin seleccionar inicialmente para que el comparador cargue más rápido."
     )
     for idx, comp in enumerate(selected_competitions):
         with st.expander(comp, expanded=False):
             comp_result = []
-            for label, player_frame in players_rows.items():
-                subset = player_frame[player_frame["competicion"].astype(str).eq(comp)]
+            for label, comp_frame in player_comp_frames.items():
+                subset = comp_frame.loc[comp_frame["competicion"].astype(str).eq(comp)]
                 if subset.empty:
                     continue
                 vals = aggregate_display_stats(subset)
                 item = {"Jugador": label}
                 for stat in chosen_stats:
                     if stat == "resultado_competicion":
-                        result_values = subset["resultado_competicion"].dropna().astype(str).drop_duplicates().tolist() if "resultado_competicion" in subset else []
+                        raw_subset = players_rows[label].loc[players_rows[label]["competicion"].astype(str).eq(comp)]
+                        result_values = raw_subset["resultado_competicion"].dropna().astype(str).drop_duplicates().tolist() if "resultado_competicion" in raw_subset else []
                         item[stat] = " · ".join(result_values) if result_values else "—"
                     else:
                         item[stat] = vals.get(stat, np.nan)
@@ -1050,36 +1228,83 @@ def comparison_tab(raw_df: pd.DataFrame, season: str, ranking: pd.DataFrame, det
         st.dataframe(subset_rank, use_container_width=True, hide_index=True)
 
 
+def build_row_indices(frame: pd.DataFrame) -> dict[tuple[str, str], np.ndarray]:
+    """Índice de posiciones de filas por (temporada, nombre normalizado)."""
+    keys = frame["nombre"].map(fold_text)
+    groups = frame.groupby([frame["temporada"], keys], sort=False, dropna=False).indices
+    return {
+        (str(key[0]), str(key[1])): np.asarray(indices, dtype=np.int64)
+        for key, indices in groups.items()
+    }
+
+
+@st.cache_data(show_spinner=False)
+def read_file_bytes(path_string: str, modified_ns: int, file_size: int) -> bytes:
+    """Lee bytes de descargas una sola vez por versión del fichero."""
+    del modified_ns, file_size
+    return Path(path_string).read_bytes()
+
+
 # ============================================================
 # MAIN
 # ============================================================
 
 if not DATASET_PATH.exists():
     st.error(
-        f"No se encuentra `{DATASET_PATH}`."
+        f"No se encuentra `{DATASET_PATH}`. Coloca dataset_ml_base.csv en la raíz "
         "del proyecto y vuelve a ejecutar Streamlit."
     )
     st.stop()
 
-try:
-    dataset = load_dataset(str(DATASET_PATH), DATASET_PATH.stat().st_mtime)
-except Exception as exc:
-    st.error(f"No se pudo cargar el dataset: {exc}")
-    st.stop()
+file_stat = DATASET_PATH.stat()
+data_signature = f"{DATASET_PATH.resolve()}::{file_stat.st_mtime_ns}::{file_stat.st_size}"
+bundle = st.session_state.get("puntuador_prepared_data_bundle")
+if bundle is None or bundle.get("signature") != data_signature:
+    try:
+        dataset = load_dataset(str(DATASET_PATH), data_signature)
+        seasons = sorted(dataset["temporada"].dropna().unique().tolist(), key=season_order)
+        positions = sorted(dataset["posicion"].dropna().astype(str).str.strip().unique().tolist())
+        competitions = sorted(dataset["competicion"].dropna().astype(str).str.strip().unique().tolist())
+        model_stats = available_model_stats(dataset)
+        if not seasons or not positions or not competitions or not model_stats:
+            st.error("El dataset no contiene temporadas, posiciones, competiciones o estadísticas suficientes.")
+            st.stop()
+        player_comp = build_player_competition_table(dataset, model_stats)
+        player_comp["__player_key"] = player_comp["nombre"].map(fold_text)
+        zdata = calculate_zscores(player_comp, model_stats)
+        bundle = {
+            "signature": data_signature,
+            "dataset": dataset,
+            "player_comp": player_comp,
+            "zdata": zdata,
+            "seasons": seasons,
+            "positions": positions,
+            "competitions": competitions,
+            "model_stats": model_stats,
+            "raw_row_indices": build_row_indices(dataset),
+            "comp_row_indices": build_row_indices(player_comp),
+        }
+        st.session_state["puntuador_prepared_data_bundle"] = bundle
+        # Si el CSV ha cambiado, no se deben reutilizar rankings calculados con datos anteriores.
+        st.session_state["puntuador_ranking_cache"] = {}
+        st.session_state["puntuador_player_detail_cache"] = {}
+    except Exception as exc:
+        st.error(f"No se pudo cargar/preparar el dataset: {exc}")
+        st.stop()
+else:
+    dataset = bundle["dataset"]
+    player_comp = bundle["player_comp"]
+    zdata = bundle["zdata"]
+    seasons = bundle["seasons"]
+    positions = bundle["positions"]
+    competitions = bundle["competitions"]
+    model_stats = bundle["model_stats"]
 
-seasons = sorted(dataset["temporada"].dropna().unique().tolist(), key=season_order)
-positions = sorted(dataset["posicion"].dropna().astype(str).str.strip().unique().tolist())
-competitions = sorted(dataset["competicion"].dropna().astype(str).str.strip().unique().tolist())
-model_stats = available_model_stats(dataset)
-if not seasons or not positions or not competitions or not model_stats:
-    st.error("El dataset no contiene temporadas, posiciones, competiciones o estadísticas suficientes.")
-    st.stop()
+# Los índices también se restauran en variables accesibles por find_player_rows.
+st.session_state["puntuador_raw_row_indices"] = bundle["raw_row_indices"]
+st.session_state["puntuador_comp_row_indices"] = bundle["comp_row_indices"]
 
-player_comp = build_player_competition_table(dataset, model_stats)
-zdata = calculate_zscores(player_comp, model_stats)
-
-# Cada temporada tiene su configuración independiente de pesos. El JSON también
-# admite migrar la configuración global de versiones anteriores.
+# Cada temporada tiene su configuración independiente de pesos.
 if "puntuador_weight_configs" not in st.session_state:
     st.session_state["puntuador_weight_configs"] = load_weight_configs(
         seasons, positions, model_stats, competitions
@@ -1092,47 +1317,74 @@ else:
         versions.setdefault(season, 0)
     st.session_state["puntuador_weight_widget_versions"] = versions
 
-# Selector de temporada disponible en TODO el dataset.
 season_default = "2025/26" if "2025/26" in seasons else seasons[-1]
 selected_season = st.selectbox(
-    "Temporada que quieres puntuar",
-    seasons,
-    index=seasons.index(season_default),
-    key="selected_season",
+    "Temporada que quieres puntuar", seasons,
+    index=seasons.index(season_default), key="selected_season",
     help="Puedes seleccionar cualquier temporada que aparezca en dataset_ml_base.csv.",
 )
-
 st.caption(
     f"Dataset: {len(dataset):,} filas · {len(seasons)} temporadas · {len(positions)} posiciones · "
     f"{len(competitions)} competiciones individuales · {len(model_stats)} variables de puntuación".replace(",", ".")
 )
 
-# La puntuación utiliza exclusivamente los pesos aplicados de la temporada seleccionada.
 stat_weights, competition_weights = weight_configs_for_season(selected_season)
-ranking, score_detail = calculate_ranking(
-    zdata, selected_season, model_stats, positions, stat_weights, competition_weights
+
+# A diferencia de st.tabs, este selector solo construye la sección activa. Así el
+# comparador no renderiza cientos de tarjetas y controles de pesos en cada cambio.
+section = st.radio(
+    "Sección de la aplicación",
+    ["🏆 Ranking", "⚙️ Pesos por posición", "🔎 Comparador"],
+    horizontal=True,
+    key="puntuador_main_section",
+    label_visibility="collapsed",
 )
 
-ranking_csv = ranking.to_csv(index=False).encode("utf-8-sig")
-detail_csv = score_detail.to_csv(index=False).encode("utf-8-sig") if not score_detail.empty else b""
-
-rank_tab, weights_tab, compare_tab = st.tabs(["🏆 Ranking", "⚙️ Pesos por posición", "🔎 Comparador"])
-
-with rank_tab:
+ranking = pd.DataFrame()
+if section == "🏆 Ranking":
+    ranking = get_cached_ranking(
+        zdata, selected_season, model_stats, positions,
+        stat_weights, competition_weights, data_signature,
+    )
     st.subheader(f"Ranking estadístico · {selected_season}")
     st.write(
         "La puntuación suma las contribuciones de cada competición. En cada competición, "
         "los z-scores se multiplican por los pesos de las estadísticas de la posición; "
-        "el total se divide por la suma fija de los pesos estadísticos permitidos para esa posición. "
-        "Después se multiplica por el peso de esa competición."
+        "el total se divide por la suma fija de los pesos estadísticos activos para esa posición "
+        "y se multiplica por el peso de la competición."
     )
     m1, m2, m3 = st.columns(3)
     m1.metric("Jugadores", f"{len(ranking):,}".replace(",", "."))
     m2.metric("Competiciones", len(competitions))
     m3.metric("Estadísticas", len(model_stats))
     d1, d2 = st.columns(2)
-    d1.download_button("Descargar ranking CSV", ranking_csv, f"ranking_puntuador_{selected_season.replace('/', '-')}.csv", "text/csv", key=f"dl_ranking_{selected_season}")
-    d2.download_button("Descargar desglose de contribuciones CSV", detail_csv, f"desglose_puntuador_{selected_season.replace('/', '-')}.csv", "text/csv", key=f"dl_detail_{selected_season}")
+    ranking_csv = ranking.to_csv(index=False).encode("utf-8-sig")
+    d1.download_button(
+        "Descargar ranking CSV", ranking_csv,
+        f"ranking_puntuador_{selected_season.replace('/', '-')}.csv", "text/csv",
+        key=f"dl_ranking_{selected_season}",
+    )
+    export_key = (data_signature, selected_season, weight_signature(stat_weights, competition_weights))
+    export_state = st.session_state.get("puntuador_detail_export", {})
+    if st.button("Preparar desglose completo de contribuciones CSV", key=f"prepare_detail_{safe_filename(selected_season)}"):
+        with st.spinner("Generando el desglose completo..."):
+            _, full_detail = calculate_ranking(
+                zdata, selected_season, model_stats, positions,
+                stat_weights, competition_weights, include_detail=True,
+            )
+            st.session_state["puntuador_detail_export"] = {
+                "key": export_key,
+                "data": full_detail.to_csv(index=False).encode("utf-8-sig") if not full_detail.empty else b"",
+            }
+            export_state = st.session_state["puntuador_detail_export"]
+    if export_state.get("key") == export_key and export_state.get("data") is not None:
+        d2.download_button(
+            "Descargar desglose completo CSV", export_state["data"],
+            f"desglose_puntuador_{selected_season.replace('/', '-')}.csv", "text/csv",
+            key=f"dl_detail_{selected_season}_{export_key[2][:8]}",
+        )
+    else:
+        d2.caption("El desglose completo se genera solo cuando lo solicitas.")
 
     if "posicion_real" in ranking.columns and ranking["posicion_real"].notna().any():
         evaluated = ranking.dropna(subset=["posicion_real"]).copy()
@@ -1148,31 +1400,31 @@ with rank_tab:
             a.metric("MAE de puesto", f"{mae:.2f}")
             b.metric("Coincidencias Top 5", f"{len(top5_pred & top5_real)}/5")
             c.metric("Coincidencias Top 10", f"{len(top10_pred & top10_real)}/10")
-            st.caption("Estas métricas solo se muestran cuando hay puestos reales en el dataset. No intervienen en el cálculo de la puntuación.")
+            st.caption("Estas métricas solo se muestran cuando hay puestos reales. No intervienen en la puntuación.")
 
-    show_ranking_cards(ranking, dataset, score_detail, selected_season)
-
-with weights_tab:
-    st.subheader(f"Pesos de la temporada {selected_season}")
-    st.info(
-        "Cada temporada guarda su propia configuración. Ajusta los valores con los controles numéricos (+/−) "
-        "y pulsa ‘Aplicar pesos’ para recalcular el ranking. Al aplicar, copiar o restablecer una temporada, "
-        "la configuración se guarda automáticamente en el JSON. Los pesos son manuales, van de 0 a 10 y "
-        "la orientación de las estadísticas positivas/negativas no se puede cambiar. Cada competición "
-        "conserva su nombre original y un peso independiente."
+    show_ranking_cards(
+        ranking, dataset, zdata, selected_season, model_stats,
+        stat_weights, competition_weights, data_signature,
     )
 
-    # Copiar la configuración ya aplicada desde otra temporada.
+elif section == "⚙️ Pesos por posición":
+    st.subheader(f"Pesos de la temporada {selected_season}")
+    st.info(
+        "Cada temporada guarda su propia configuración. Modifica los controles numéricos (+/−) y pulsa "
+        "‘Aplicar pesos’ para guardar los cambios de la posición seleccionada. Los pesos van de 0 a 10, "
+        "la orientación positiva/negativa es fija y cada competición conserva su nombre individual. "
+        "Para no perder cambios, aplica los pesos antes de cambiar de posición o temporada."
+    )
+
     other_seasons = [season for season in seasons if season != selected_season]
     if other_seasons:
         copy_col, copy_button_col = st.columns([3, 1.5])
         with copy_col:
             source_season = st.selectbox(
-                "Copiar pesos desde otra temporada",
-                other_seasons,
+                "Copiar pesos de esta temporada", other_seasons,
                 index=other_seasons.index("2025/26") if "2025/26" in other_seasons else 0,
                 key=f"copy_weights_source_{safe_filename(selected_season)}",
-                help="Copia los pesos de todas las posiciones, estadísticas y competiciones. No copia el ranking."
+                help="Elige la temporada de origen. Se copian los pesos de todas las posiciones, estadísticas y competiciones.",
             )
         with copy_button_col:
             st.markdown(" ")
@@ -1183,78 +1435,67 @@ with weights_tab:
                 args=(source_season, selected_season, positions, model_stats, competitions),
                 use_container_width=True,
             )
-        st.caption("Copia la configuración aplicada de origen. Aplica primero cualquier cambio pendiente antes de copiarlo.")
+        st.caption("Se copia la configuración aplicada de origen. Aplica primero cualquier cambio pendiente.")
 
     copied_notice = st.session_state.get("puntuador_weights_copy_notice")
     if copied_notice and copied_notice[1] == selected_season:
         st.success(f"Pesos copiados desde {copied_notice[0]} a {selected_season} y guardados automáticamente.")
     if st.session_state.get("puntuador_weights_applied_notice") == selected_season:
-        st.success(f"Pesos aplicados para {selected_season}; el ranking ya utiliza estos valores.")
+        st.success(f"Pesos aplicados para {selected_season}; el ranking usará estos valores al abrir la sección Ranking.")
     if st.session_state.get("puntuador_weights_saved_notice"):
         st.caption(f"Configuraciones guardadas en `{WEIGHTS_PATH}`.")
     save_error = st.session_state.get("puntuador_weights_save_error", "")
     if save_error:
-        st.warning(f"No se pudieron guardar automáticamente los pesos en disco: {save_error}. Puedes descargarlos desde la barra lateral.")
+        st.warning(f"No se pudieron guardar automáticamente los pesos: {save_error}.")
 
-    with st.form(f"puntuador_weights_form_{safe_filename(selected_season)}", clear_on_submit=False):
-        position_tabs = st.tabs(positions)
-        configs = st.session_state["puntuador_weight_configs"]
-        season_stat_config = configs["stat_weights_by_season"].get(selected_season, {})
-        season_comp_config = configs["competition_weights_by_season"].get(selected_season, {})
-
-        for position_idx, position in enumerate(positions):
-            with position_tabs[position_idx]:
-                st.markdown(f"### {position}")
-                stats_col, comp_col = st.columns(2)
-                allowed_stats = stats_allowed_for_position(position, model_stats)
-
-                with stats_col:
-                    with st.expander("⚙️ Pesos de las estadísticas", expanded=True):
-                        st.caption("Cada estadística mantiene la orientación fija del modelo original.")
-                        for stat in allowed_stats:
-                            label_col, spin_col = st.columns([2.4, 1])
-                            with label_col:
-                                sign = "−" if stat_sign(stat) < 0 else "+"
-                                st.markdown(f"{sign} {stat}")
-                            with spin_col:
-                                st.number_input(
-                                    f"Peso de {stat}",
-                                    min_value=0.0,
-                                    max_value=10.0,
-                                    step=0.1,
-                                    value=clamp_weight(season_stat_config.get(position, {}).get(stat, 1.0)),
-                                    format="%.1f",
-                                    key=stat_weight_widget_key(selected_season, position, stat),
-                                    label_visibility="collapsed",
-                                    help="Peso entre 0 y 10. Usa los botones + y − para ajustarlo.",
-                                )
-
-                with comp_col:
-                    with st.expander("🏆 Pesos de las competiciones", expanded=True):
-                        st.caption("Cada competición es individual, sin agrupar por categorías.")
-                        for competition in competitions:
-                            label_col, spin_col = st.columns([2.4, 1])
-                            with label_col:
-                                st.markdown(competition)
-                            with spin_col:
-                                st.number_input(
-                                    f"Peso de {competition}",
-                                    min_value=0.0,
-                                    max_value=10.0,
-                                    step=0.1,
-                                    value=clamp_weight(season_comp_config.get(position, {}).get(competition, 1.0)),
-                                    format="%.1f",
-                                    key=competition_weight_widget_key(selected_season, position, competition),
-                                    label_visibility="collapsed",
-                                    help="Peso entre 0 y 10. Usa los botones + y − para ajustarlo.",
-                                )
-
+    selected_position = st.selectbox(
+        "Posición cuyos pesos quieres editar", positions,
+        key=f"weight_position_{safe_filename(selected_season)}",
+    )
+    configs = st.session_state["puntuador_weight_configs"]
+    season_stat_config = configs["stat_weights_by_season"].get(selected_season, {})
+    season_comp_config = configs["competition_weights_by_season"].get(selected_season, {})
+    form_key = f"puntuador_weights_form_{safe_filename(selected_season)}_{safe_filename(selected_position)}"
+    with st.form(form_key, clear_on_submit=False):
+        stats_col, comp_col = st.columns(2)
+        allowed_stats = stats_allowed_for_position(selected_position, model_stats)
+        with stats_col:
+            with st.expander("⚙️ Pesos de las estadísticas", expanded=True):
+                st.caption("Las estadísticas negativas se mantienen negativas; el peso solo controla su magnitud.")
+                for stat in allowed_stats:
+                    label_col, spin_col = st.columns([2.4, 1])
+                    with label_col:
+                        sign = "−" if stat_sign(stat) < 0 else "+"
+                        st.markdown(f"{sign} {stat}")
+                    with spin_col:
+                        st.number_input(
+                            f"Peso de {stat}", min_value=0.0, max_value=10.0, step=0.1,
+                            value=clamp_weight(season_stat_config.get(selected_position, {}).get(stat, 1.0)),
+                            format="%.1f",
+                            key=stat_weight_widget_key(selected_season, selected_position, stat),
+                            label_visibility="collapsed",
+                            help="Peso entre 0 y 10. Usa + y − para ajustarlo.",
+                        )
+        with comp_col:
+            with st.expander("🏆 Pesos de las competiciones", expanded=True):
+                st.caption("Cada competición conserva su nombre y su peso individual.")
+                for competition in competitions:
+                    label_col, spin_col = st.columns([2.4, 1])
+                    with label_col:
+                        st.markdown(competition)
+                    with spin_col:
+                        st.number_input(
+                            f"Peso de {competition}", min_value=0.0, max_value=10.0, step=0.1,
+                            value=clamp_weight(season_comp_config.get(selected_position, {}).get(competition, 1.0)),
+                            format="%.1f",
+                            key=competition_weight_widget_key(selected_season, selected_position, competition),
+                            label_visibility="collapsed",
+                            help="Peso entre 0 y 10. Usa + y − para ajustarlo.",
+                        )
         st.form_submit_button(
-            "✅ Aplicar pesos y recalcular ranking",
-            type="primary",
-            use_container_width=True,
+            f"✅ Aplicar pesos de {selected_position}", type="primary", use_container_width=True,
             on_click=apply_weight_inputs,
-            args=(selected_season, positions, model_stats, competitions),
+            args=(selected_season, selected_position, model_stats, competitions),
         )
 
     save_col, reset_col, _ = st.columns([1.5, 1.7, 3])
@@ -1271,36 +1512,43 @@ with weights_tab:
             key=f"reset_weights_{safe_filename(selected_season)}",
             on_click=reset_season_weights,
             args=(selected_season, positions, model_stats, competitions),
-            help="Restablece únicamente la temporada seleccionada. Las demás no cambian.",
+            help="Restablece únicamente la temporada seleccionada.",
             use_container_width=True,
         )
     st.caption(
-        "Los pesos quedan separados por temporada y se guardan automáticamente al aplicar, copiar o restablecer. "
-        "Al copiar, solo se reemplaza la temporada de destino."
+        "Las configuraciones son independientes por temporada y se guardan en JSON. "
+        "El ranking solo se recalcula cuando abres la sección Ranking o Comparador."
     )
 
-with compare_tab:
-    comparison_tab(dataset, selected_season, ranking, score_detail)
+else:
+    ranking = get_cached_ranking(
+        zdata, selected_season, model_stats, positions,
+        stat_weights, competition_weights, data_signature,
+    )
+    comparison_tab(dataset, player_comp, selected_season, ranking)
 
 with st.sidebar:
     st.header("Archivos")
     st.caption("Archivos locales del puntuador.")
     if DATASET_PATH.exists():
-        st.download_button(
-            "Descargar dataset_ml_base.csv",
-            DATASET_PATH.read_bytes(),
-            "dataset_ml_base.csv",
-            "text/csv",
-            key="download_dataset",
-        )
+        try:
+            st.download_button(
+                "Descargar dataset_ml_base.csv",
+                read_file_bytes(str(DATASET_PATH), file_stat.st_mtime_ns, file_stat.st_size),
+                "dataset_ml_base.csv", "text/csv", key="download_dataset",
+            )
+        except OSError as exc:
+            st.warning(f"No se pudo leer el dataset: {exc}")
     if WEIGHTS_PATH.exists():
-        st.download_button(
-            "Descargar configuración de pesos JSON",
-            WEIGHTS_PATH.read_bytes(),
-            WEIGHTS_PATH.name,
-            "application/json",
-            key="download_weights_json",
-        )
+        try:
+            weight_stat = WEIGHTS_PATH.stat()
+            st.download_button(
+                "Descargar configuración de pesos JSON",
+                read_file_bytes(str(WEIGHTS_PATH), weight_stat.st_mtime_ns, weight_stat.st_size),
+                WEIGHTS_PATH.name, "application/json", key="download_weights_json",
+            )
+        except OSError as exc:
+            st.warning(f"No se pudo leer el JSON de pesos: {exc}")
     st.markdown("---")
     st.markdown("**Fórmula utilizada**")
     st.latex(r"S_{p,c}=\frac{\sum_s d_s\,z_{p,c,s}\,w_{p,s}}{\sum_s w_{p,s}}\,W_{p,c}")
@@ -1310,8 +1558,8 @@ with st.sidebar:
 st.divider()
 st.caption(
     "Notas: las competiciones no se agrupan ni se renombran. Los jugadores sin datos en una competición "
-    "no reciben una contribución por ella. Un dato estadístico ausente se trata como contribución neutra "
-    "(z-score 0) y no entra en el cálculo de la media/desviación. Si una variable no varía en una competición, "
-    "su z-score es 0. Los puestos reales 1–30 de 2025/26 se sustituyen por la clasificación facilitada. "
-    "Los pesos iniciales a 1 son valores de partida editables, no una afirmación sobre la importancia real."
+    "no reciben una contribución por ella. Un dato ausente se trata como contribución neutra (z-score 0) "
+    "y no entra en la media/desviación. Si una variable no varía en una competición, su z-score es 0. "
+    "Los puestos reales 1–30 de 2025/26 se sustituyen por la clasificación facilitada. Los pesos iniciales a 1 "
+    "son valores de partida editables, no una afirmación sobre su importancia real."
 )
