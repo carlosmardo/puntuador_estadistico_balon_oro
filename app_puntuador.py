@@ -477,15 +477,61 @@ def table_to_weight_map(table: pd.DataFrame, label_col: str) -> dict[str, float]
     return weights
 
 
+def stat_editor_key(idx: int) -> str:
+    """Clave interna del widget; nunca se asigna manualmente en session_state."""
+    version = int(st.session_state.get("puntuador_editor_version", 0))
+    return f"stat_weights_editor_{idx}_v{version}"
+
+
+def competition_editor_key(idx: int) -> str:
+    """Clave interna del widget; cambia al restablecer los pesos."""
+    version = int(st.session_state.get("puntuador_editor_version", 0))
+    return f"competition_weights_editor_{idx}_v{version}"
+
+
+def apply_data_editor_changes(base_table: pd.DataFrame, editor_key: str) -> pd.DataFrame:
+    """Reconstruye el DataFrame a partir de la tabla base y las celdas editadas.
+
+    Streamlit guarda en session_state de st.data_editor un objeto DataEditorState
+    (con edited_rows), no el DataFrame completo. Como el editor usa num_rows='fixed',
+    basta con aplicar las ediciones de las filas existentes.
+    """
+    table = base_table.copy(deep=True)
+    state = st.session_state.get(editor_key)
+    if state is None:
+        return table
+
+    edits = getattr(state, "edited_rows", None)
+    if edits is None and isinstance(state, dict):
+        edits = state.get("edited_rows", {})
+    if not isinstance(edits, dict):
+        return table
+
+    for row_position, changes in edits.items():
+        try:
+            row_position = int(row_position)
+        except (TypeError, ValueError):
+            continue
+        if row_position < 0 or row_position >= len(table) or not isinstance(changes, dict):
+            continue
+        for column, value in changes.items():
+            if column in table.columns:
+                table.iloc[row_position, table.columns.get_loc(column)] = value
+    return table
+
+
 def current_weight_maps(positions: list[str], stats: list[str], competitions: list[str]):
     stat_weights: dict[str, dict[str, float]] = {}
     comp_weights: dict[str, dict[str, float]] = {}
     defaults_stats, defaults_comps = default_weight_tables(positions, stats, competitions)
     for idx, position in enumerate(positions):
-        skey = f"stat_weights_editor_{idx}"
-        ckey = f"competition_weights_editor_{idx}"
-        stat_table = st.session_state.get(skey, defaults_stats[position])
-        comp_table = st.session_state.get(ckey, defaults_comps[position])
+        # Las tablas base están en claves independientes de las claves del widget.
+        stat_base_key = f"stat_weights_base_{idx}"
+        comp_base_key = f"competition_weights_base_{idx}"
+        stat_base = st.session_state.get(stat_base_key, defaults_stats[position])
+        comp_base = st.session_state.get(comp_base_key, defaults_comps[position])
+        stat_table = apply_data_editor_changes(stat_base, stat_editor_key(idx))
+        comp_table = apply_data_editor_changes(comp_base, competition_editor_key(idx))
         stat_weights[position] = table_to_weight_map(stat_table, "Estadística")
         comp_weights[position] = table_to_weight_map(comp_table, "Competición")
     return stat_weights, comp_weights
@@ -503,10 +549,18 @@ def save_weights(stat_weights: dict, comp_weights: dict):
 
 
 def reset_widget_weights(positions: list[str], stats: list[str], competitions: list[str]):
+    """Restablece las tablas base y cambia las claves para crear widgets limpios.
+
+    No escribe nunca en las claves internas de st.data_editor, ya que Streamlit
+    prohíbe asignarles valores mediante st.session_state.
+    """
     default_stats, default_comps = default_weight_tables(positions, stats, competitions)
     for idx, position in enumerate(positions):
-        st.session_state[f"stat_weights_editor_{idx}"] = default_stats[position]
-        st.session_state[f"competition_weights_editor_{idx}"] = default_comps[position]
+        st.session_state[f"stat_weights_base_{idx}"] = default_stats[position].copy(deep=True)
+        st.session_state[f"competition_weights_base_{idx}"] = default_comps[position].copy(deep=True)
+    st.session_state["puntuador_editor_version"] = int(
+        st.session_state.get("puntuador_editor_version", 0)
+    ) + 1
 
 
 def calculate_ranking(
@@ -882,12 +936,14 @@ if not seasons or not positions or not competitions or not model_stats:
 player_comp = build_player_competition_table(dataset, model_stats)
 zdata = calculate_zscores(player_comp, model_stats)
 
-# Inicializar las tablas de widgets una sola vez. Si existe JSON, se carga como base.
+# Inicializar las tablas base una sola vez. Las claves del data_editor se reservan
+# exclusivamente para el estado interno del widget; nunca se les asignan DataFrames.
 if "puntuador_weights_initialized" not in st.session_state:
     stat_defaults, comp_defaults = load_saved_weights(positions, model_stats, competitions)
     for idx, position in enumerate(positions):
-        st.session_state[f"stat_weights_editor_{idx}"] = stat_defaults[position]
-        st.session_state[f"competition_weights_editor_{idx}"] = comp_defaults[position]
+        st.session_state[f"stat_weights_base_{idx}"] = stat_defaults[position].copy(deep=True)
+        st.session_state[f"competition_weights_base_{idx}"] = comp_defaults[position].copy(deep=True)
+    st.session_state["puntuador_editor_version"] = 0
     st.session_state["puntuador_weights_initialized"] = True
 
 # Selector de temporada disponible en TODO el dataset.
@@ -967,8 +1023,8 @@ with weights_tab:
                 st.caption("El denominador se mantiene fijo por posición: reducir el peso de una estadística no aumenta artificialmente las demás.")
                 stat_table_default = default_weight_tables(positions, model_stats, competitions)[0][position]
                 st.data_editor(
-                    st.session_state[f"stat_weights_editor_{idx}"],
-                    key=f"stat_weights_editor_{idx}",
+                    st.session_state[f"stat_weights_base_{idx}"],
+                    key=stat_editor_key(idx),
                     use_container_width=True,
                     hide_index=True,
                     num_rows="fixed",
@@ -984,8 +1040,8 @@ with weights_tab:
                 st.caption("Cada competición se pondera por separado; no se agrupa en categorías como ‘grandes ligas’.")
                 comp_table_default = default_weight_tables(positions, model_stats, competitions)[1][position]
                 st.data_editor(
-                    st.session_state[f"competition_weights_editor_{idx}"],
-                    key=f"competition_weights_editor_{idx}",
+                    st.session_state[f"competition_weights_base_{idx}"],
+                    key=competition_editor_key(idx),
                     use_container_width=True,
                     hide_index=True,
                     num_rows="fixed",
