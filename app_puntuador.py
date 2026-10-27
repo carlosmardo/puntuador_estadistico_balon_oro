@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import copy
 import re
 import unicodedata
 from html import escape as html_escape
@@ -494,147 +495,194 @@ def calculate_zscores(player_comp: pd.DataFrame, model_stats: list[str]) -> pd.D
 # PESOS: ESTADÍSTICAS Y COMPETICIONES POR POSICIÓN
 # ============================================================
 
-def default_weight_tables(positions: list[str], stats: list[str], competitions: list[str]):
-    stat_tables: dict[str, pd.DataFrame] = {}
-    competition_tables: dict[str, pd.DataFrame] = {}
-    for position in positions:
-        allowed = stats_allowed_for_position(position, stats)
-        stat_tables[position] = pd.DataFrame({
-            "Estadística": allowed,
-            "Orientación": ["Negativa" if stat_sign(s) < 0 else "Positiva" for s in allowed],
-            "Peso": [1.0] * len(allowed),
-        })
-        competition_tables[position] = pd.DataFrame({
-            "Competición": competitions,
-            "Peso": [1.0] * len(competitions),
-        })
-    return stat_tables, competition_tables
+def default_weight_maps(positions: list[str], stats: list[str], competitions: list[str]):
+    """Pesos iniciales (1.0) para cada posición, estadística y competición."""
+    stat_weights = {
+        position: {stat: 1.0 for stat in stats_allowed_for_position(position, stats)}
+        for position in positions
+    }
+    competition_weights = {
+        position: {competition: 1.0 for competition in competitions}
+        for position in positions
+    }
+    return stat_weights, competition_weights
 
 
-def load_saved_weights(positions: list[str], stats: list[str], competitions: list[str]):
-    default_stats, default_comps = default_weight_tables(positions, stats, competitions)
+def clamp_weight(value: Any, default: float = 1.0) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = default
+    if not np.isfinite(number):
+        number = default
+    return float(np.clip(number, 0.0, 10.0))
+
+
+def create_default_weight_configs(
+    seasons: list[str], positions: list[str], stats: list[str], competitions: list[str]
+) -> dict[str, Any]:
+    stat_defaults, comp_defaults = default_weight_maps(positions, stats, competitions)
+    return {
+        "version": 2,
+        "stat_weights_by_season": {
+            season: copy.deepcopy(stat_defaults) for season in seasons
+        },
+        "competition_weights_by_season": {
+            season: copy.deepcopy(comp_defaults) for season in seasons
+        },
+    }
+
+
+def load_weight_configs(
+    seasons: list[str], positions: list[str], stats: list[str], competitions: list[str]
+) -> dict[str, Any]:
+    """Carga los pesos por temporada y migra el antiguo JSON global si lo encuentra."""
+    configs = create_default_weight_configs(seasons, positions, stats, competitions)
     if not WEIGHTS_PATH.exists():
-        return default_stats, default_comps
+        return configs
+
     try:
         saved = json.loads(WEIGHTS_PATH.read_text(encoding="utf-8"))
     except Exception:
-        st.warning("No se pudo leer el archivo de pesos guardado. Se usarán pesos iniciales de 1.")
-        return default_stats, default_comps
+        st.warning("No se pudo leer el JSON de pesos guardado. Se usarán pesos iniciales de 1.")
+        return configs
 
-    saved_stats = saved.get("stat_weights", {})
-    saved_comps = saved.get("competition_weights", {})
-    for position in positions:
-        if position in saved_stats:
-            default_stats[position]["Peso"] = [
-                max(0.0, float(saved_stats[position].get(stat, 1.0)))
-                for stat in default_stats[position]["Estadística"]
-            ]
-        if position in saved_comps:
-            default_comps[position]["Peso"] = [
-                max(0.0, float(saved_comps[position].get(comp, 1.0)))
-                for comp in default_comps[position]["Competición"]
-            ]
-    return default_stats, default_comps
+    saved_stats_by_season = saved.get("stat_weights_by_season", {})
+    saved_comps_by_season = saved.get("competition_weights_by_season", {})
 
+    # Compatibilidad: versión antigua con una sola configuración para todas las temporadas.
+    legacy_stats = saved.get("stat_weights", {})
+    legacy_comps = saved.get("competition_weights", {})
 
-def table_to_weight_map(table: pd.DataFrame, label_col: str) -> dict[str, float]:
-    if table is None or table.empty:
-        return {}
-    weights = {}
-    for row in table.to_dict("records"):
-        label = str(row.get(label_col, ""))
-        try:
-            value = float(row.get("Peso", 1.0))
-        except (TypeError, ValueError):
-            value = 1.0
-        weights[label] = float(np.clip(value if np.isfinite(value) else 1.0, 0.0, 10.0))
-    return weights
+    for season in seasons:
+        season_stats = saved_stats_by_season.get(season, {})
+        season_comps = saved_comps_by_season.get(season, {})
+        for position in positions:
+            allowed = stats_allowed_for_position(position, stats)
+            stats_source = season_stats.get(position, {})
+            comps_source = season_comps.get(position, {})
+            if not stats_source and legacy_stats:
+                stats_source = legacy_stats.get(position, {})
+            if not comps_source and legacy_comps:
+                comps_source = legacy_comps.get(position, {})
+            configs["stat_weights_by_season"][season][position] = {
+                stat: clamp_weight(stats_source.get(stat, 1.0)) for stat in allowed
+            }
+            configs["competition_weights_by_season"][season][position] = {
+                comp: clamp_weight(comps_source.get(comp, 1.0)) for comp in competitions
+            }
+    return configs
 
 
-def stat_editor_key(idx: int) -> str:
-    """Clave interna del widget; nunca se asigna manualmente en session_state."""
-    version = int(st.session_state.get("puntuador_editor_version", 0))
-    return f"stat_weights_editor_{idx}_v{version}"
-
-
-def competition_editor_key(idx: int) -> str:
-    """Clave interna del widget; cambia al restablecer los pesos."""
-    version = int(st.session_state.get("puntuador_editor_version", 0))
-    return f"competition_weights_editor_{idx}_v{version}"
-
-
-def apply_data_editor_changes(base_table: pd.DataFrame, editor_key: str) -> pd.DataFrame:
-    """Reconstruye el DataFrame a partir de la tabla base y las celdas editadas.
-
-    Streamlit guarda en session_state de st.data_editor un objeto DataEditorState
-    (con edited_rows), no el DataFrame completo. Como el editor usa num_rows='fixed',
-    basta con aplicar las ediciones de las filas existentes.
-    """
-    table = base_table.copy(deep=True)
-    state = st.session_state.get(editor_key)
-    if state is None:
-        return table
-
-    edits = getattr(state, "edited_rows", None)
-    if edits is None and isinstance(state, dict):
-        edits = state.get("edited_rows", {})
-    if not isinstance(edits, dict):
-        return table
-
-    for row_position, changes in edits.items():
-        try:
-            row_position = int(row_position)
-        except (TypeError, ValueError):
-            continue
-        if row_position < 0 or row_position >= len(table) or not isinstance(changes, dict):
-            continue
-        for column, value in changes.items():
-            if column in table.columns:
-                table.iloc[row_position, table.columns.get_loc(column)] = value
-    return table
-
-
-def current_weight_maps(positions: list[str], stats: list[str], competitions: list[str]):
-    stat_weights: dict[str, dict[str, float]] = {}
-    comp_weights: dict[str, dict[str, float]] = {}
-    defaults_stats, defaults_comps = default_weight_tables(positions, stats, competitions)
-    for idx, position in enumerate(positions):
-        # Las tablas base están en claves independientes de las claves del widget.
-        stat_base_key = f"stat_weights_base_{idx}"
-        comp_base_key = f"competition_weights_base_{idx}"
-        stat_base = st.session_state.get(stat_base_key, defaults_stats[position])
-        comp_base = st.session_state.get(comp_base_key, defaults_comps[position])
-        stat_table = apply_data_editor_changes(stat_base, stat_editor_key(idx))
-        comp_table = apply_data_editor_changes(comp_base, competition_editor_key(idx))
-        stat_weights[position] = table_to_weight_map(stat_table, "Estadística")
-        comp_weights[position] = table_to_weight_map(comp_table, "Competición")
-    return stat_weights, comp_weights
-
-
-def save_weights(stat_weights: dict, comp_weights: dict):
+def save_weight_configs(configs: dict[str, Any]) -> None:
     payload = {
-        "version": 1,
-        "description": "Pesos manuales del puntuador estadístico; no son coeficientes aprendidos.",
-        "stat_weights": stat_weights,
-        "competition_weights": comp_weights,
+        "version": 2,
+        "description": (
+            "Pesos manuales independientes por temporada, posición, estadística y competición. "
+            "No son coeficientes aprendidos por Machine Learning."
+        ),
+        "stat_weights_by_season": configs.get("stat_weights_by_season", {}),
+        "competition_weights_by_season": configs.get("competition_weights_by_season", {}),
     }
     WEIGHTS_PATH.parent.mkdir(parents=True, exist_ok=True)
     WEIGHTS_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def reset_widget_weights(positions: list[str], stats: list[str], competitions: list[str]):
-    """Restablece las tablas base y cambia las claves para crear widgets limpios.
+def autosave_weight_configs(configs: dict[str, Any]) -> None:
+    """Guarda cambios aplicados sin romper la app si el sistema de archivos no es escribible."""
+    try:
+        save_weight_configs(configs)
+        st.session_state["puntuador_weights_save_error"] = ""
+        st.session_state["puntuador_weights_saved_notice"] = True
+    except OSError as exc:
+        st.session_state["puntuador_weights_save_error"] = str(exc)
 
-    No escribe nunca en las claves internas de st.data_editor, ya que Streamlit
-    prohíbe asignarles valores mediante st.session_state.
-    """
-    default_stats, default_comps = default_weight_tables(positions, stats, competitions)
-    for idx, position in enumerate(positions):
-        st.session_state[f"stat_weights_base_{idx}"] = default_stats[position].copy(deep=True)
-        st.session_state[f"competition_weights_base_{idx}"] = default_comps[position].copy(deep=True)
-    st.session_state["puntuador_editor_version"] = int(
-        st.session_state.get("puntuador_editor_version", 0)
-    ) + 1
+
+def stat_weight_widget_key(season: str, position: str, stat: str) -> str:
+    version = int(st.session_state.get("puntuador_weight_widget_versions", {}).get(season, 0))
+    return f"wstat::{season}::{position}::{stat}::v{version}"
+
+
+def competition_weight_widget_key(season: str, position: str, competition: str) -> str:
+    version = int(st.session_state.get("puntuador_weight_widget_versions", {}).get(season, 0))
+    return f"wcomp::{season}::{position}::{competition}::v{version}"
+
+
+def weight_configs_for_season(season: str) -> tuple[dict[str, dict[str, float]], dict[str, dict[str, float]]]:
+    configs = st.session_state["puntuador_weight_configs"]
+    stat_by_season = configs["stat_weights_by_season"]
+    comp_by_season = configs["competition_weights_by_season"]
+    return (
+        copy.deepcopy(stat_by_season.get(season, {})),
+        copy.deepcopy(comp_by_season.get(season, {})),
+    )
+
+
+def apply_weight_inputs(season: str, positions: list[str], stats: list[str], competitions: list[str]) -> None:
+    """Callback del formulario: aplica todos los spin buttons de la temporada activa."""
+    configs = copy.deepcopy(st.session_state["puntuador_weight_configs"])
+    stat_season = configs["stat_weights_by_season"].setdefault(season, {})
+    comp_season = configs["competition_weights_by_season"].setdefault(season, {})
+
+    for position in positions:
+        allowed = stats_allowed_for_position(position, stats)
+        stat_season.setdefault(position, {})
+        comp_season.setdefault(position, {})
+        for stat in allowed:
+            key = stat_weight_widget_key(season, position, stat)
+            old_value = stat_season[position].get(stat, 1.0)
+            stat_season[position][stat] = clamp_weight(st.session_state.get(key, old_value))
+        for competition in competitions:
+            key = competition_weight_widget_key(season, position, competition)
+            old_value = comp_season[position].get(competition, 1.0)
+            comp_season[position][competition] = clamp_weight(st.session_state.get(key, old_value))
+
+    st.session_state["puntuador_weight_configs"] = configs
+    autosave_weight_configs(configs)
+    st.session_state["puntuador_weights_applied_notice"] = season
+
+
+def copy_weights_between_seasons(
+    source_season: str, target_season: str, positions: list[str], stats: list[str], competitions: list[str]
+) -> None:
+    """Copia todas las ponderaciones de una temporada a otra y recrea sus widgets."""
+    if source_season == target_season:
+        return
+    configs = copy.deepcopy(st.session_state["puntuador_weight_configs"])
+    source_stat = configs["stat_weights_by_season"].get(source_season, {})
+    source_comp = configs["competition_weights_by_season"].get(source_season, {})
+    target_stat, target_comp = default_weight_maps(positions, stats, competitions)
+    for position in positions:
+        target_stat[position] = {
+            stat: clamp_weight(source_stat.get(position, {}).get(stat, 1.0))
+            for stat in stats_allowed_for_position(position, stats)
+        }
+        target_comp[position] = {
+            comp: clamp_weight(source_comp.get(position, {}).get(comp, 1.0))
+            for comp in competitions
+        }
+    configs["stat_weights_by_season"][target_season] = target_stat
+    configs["competition_weights_by_season"][target_season] = target_comp
+    st.session_state["puntuador_weight_configs"] = configs
+    autosave_weight_configs(configs)
+    versions = dict(st.session_state.get("puntuador_weight_widget_versions", {}))
+    versions[target_season] = int(versions.get(target_season, 0)) + 1
+    st.session_state["puntuador_weight_widget_versions"] = versions
+    st.session_state["puntuador_weights_applied_notice"] = target_season
+    st.session_state["puntuador_weights_copy_notice"] = (source_season, target_season)
+
+
+def reset_season_weights(season: str, positions: list[str], stats: list[str], competitions: list[str]) -> None:
+    configs = copy.deepcopy(st.session_state["puntuador_weight_configs"])
+    stat_defaults, comp_defaults = default_weight_maps(positions, stats, competitions)
+    configs["stat_weights_by_season"][season] = stat_defaults
+    configs["competition_weights_by_season"][season] = comp_defaults
+    st.session_state["puntuador_weight_configs"] = configs
+    autosave_weight_configs(configs)
+    versions = dict(st.session_state.get("puntuador_weight_widget_versions", {}))
+    versions[season] = int(versions.get(season, 0)) + 1
+    st.session_state["puntuador_weight_widget_versions"] = versions
+    st.session_state["puntuador_weights_applied_notice"] = season
 
 
 @st.cache_data(show_spinner=False, max_entries=12)
@@ -1030,15 +1078,19 @@ if not seasons or not positions or not competitions or not model_stats:
 player_comp = build_player_competition_table(dataset, model_stats)
 zdata = calculate_zscores(player_comp, model_stats)
 
-# Inicializar las tablas base una sola vez. Las claves del data_editor se reservan
-# exclusivamente para el estado interno del widget; nunca se les asignan DataFrames.
-if "puntuador_weights_initialized" not in st.session_state:
-    stat_defaults, comp_defaults = load_saved_weights(positions, model_stats, competitions)
-    for idx, position in enumerate(positions):
-        st.session_state[f"stat_weights_base_{idx}"] = stat_defaults[position].copy(deep=True)
-        st.session_state[f"competition_weights_base_{idx}"] = comp_defaults[position].copy(deep=True)
-    st.session_state["puntuador_editor_version"] = 0
-    st.session_state["puntuador_weights_initialized"] = True
+# Cada temporada tiene su configuración independiente de pesos. El JSON también
+# admite migrar la configuración global de versiones anteriores.
+if "puntuador_weight_configs" not in st.session_state:
+    st.session_state["puntuador_weight_configs"] = load_weight_configs(
+        seasons, positions, model_stats, competitions
+    )
+if "puntuador_weight_widget_versions" not in st.session_state:
+    st.session_state["puntuador_weight_widget_versions"] = {season: 0 for season in seasons}
+else:
+    versions = dict(st.session_state["puntuador_weight_widget_versions"])
+    for season in seasons:
+        versions.setdefault(season, 0)
+    st.session_state["puntuador_weight_widget_versions"] = versions
 
 # Selector de temporada disponible en TODO el dataset.
 season_default = "2025/26" if "2025/26" in seasons else seasons[-1]
@@ -1055,8 +1107,8 @@ st.caption(
     f"{len(competitions)} competiciones individuales · {len(model_stats)} variables de puntuación".replace(",", ".")
 )
 
-# Leer pesos actuales desde el estado de los editores; cambiar cualquier valor recalcula el ranking.
-stat_weights, competition_weights = current_weight_maps(positions, model_stats, competitions)
+# La puntuación utiliza exclusivamente los pesos aplicados de la temporada seleccionada.
+stat_weights, competition_weights = weight_configs_for_season(selected_season)
 ranking, score_detail = calculate_ranking(
     zdata, selected_season, model_stats, positions, stat_weights, competition_weights
 )
@@ -1101,74 +1153,131 @@ with rank_tab:
     show_ranking_cards(ranking, dataset, score_detail, selected_season)
 
 with weights_tab:
-    st.subheader("Configurar los pesos")
+    st.subheader(f"Pesos de la temporada {selected_season}")
     st.info(
-        "Son pesos manuales y fijos, no se entrenan automáticamente. El peso de cada estadística "
-        "solo puede ir de 0 a 10; su orientación positiva o negativa está bloqueada según las "
-        "restricciones del código de ML. Cada competición conserva su nombre original y tiene un peso propio. "
-        "Para evitar recalcular el ranking en cada celda, modifica todos los valores que necesites y pulsa "
-        "‘Aplicar pesos y recalcular ranking’ al final del formulario."
+        "Cada temporada guarda su propia configuración. Ajusta los valores con los controles numéricos (+/−) "
+        "y pulsa ‘Aplicar pesos’ para recalcular el ranking. Al aplicar, copiar o restablecer una temporada, "
+        "la configuración se guarda automáticamente en el JSON. Los pesos son manuales, van de 0 a 10 y "
+        "la orientación de las estadísticas positivas/negativas no se puede cambiar. Cada competición "
+        "conserva su nombre original y un peso independiente."
     )
-    with st.form("puntuador_weights_form", clear_on_submit=False):
-        position_tabs = st.tabs(positions)
-        for idx, position in enumerate(positions):
-            with position_tabs[idx]:
-                st.markdown(f"### {position}")
-                left, right = st.columns([1, 1])
-                with left:
-                    st.markdown("#### Pesos de las estadísticas")
-                    st.caption("El denominador se calcula con los pesos de las estadísticas activas para esa posición y competición.")
-                    stat_table_default = default_weight_tables(positions, model_stats, competitions)[0][position]
-                    st.data_editor(
-                        st.session_state[f"stat_weights_base_{idx}"],
-                        key=stat_editor_key(idx),
-                        use_container_width=True,
-                        hide_index=True,
-                        num_rows="fixed",
-                        height=min(650, 45 + len(stat_table_default) * 35),
-                        column_config={
-                            "Estadística": st.column_config.TextColumn("Estadística", disabled=True),
-                            "Orientación": st.column_config.TextColumn("Orientación (fija)", disabled=True),
-                            "Peso": st.column_config.NumberColumn("Peso (0–10)", min_value=0.0, max_value=10.0, step=0.1, format="%.2f"),
-                        },
-                    )
-                with right:
-                    st.markdown("#### Pesos de las competiciones")
-                    st.caption("Cada competición se pondera por separado; no se agrupa en categorías.")
-                    comp_table_default = default_weight_tables(positions, model_stats, competitions)[1][position]
-                    st.data_editor(
-                        st.session_state[f"competition_weights_base_{idx}"],
-                        key=competition_editor_key(idx),
-                        use_container_width=True,
-                        hide_index=True,
-                        num_rows="fixed",
-                        height=min(650, 45 + len(comp_table_default) * 35),
-                        column_config={
-                            "Competición": st.column_config.TextColumn("Competición individual", disabled=True),
-                            "Peso": st.column_config.NumberColumn("Peso (0–10)", min_value=0.0, max_value=10.0, step=0.1, format="%.2f"),
-                        },
-                    )
-        apply_clicked = st.form_submit_button(
-            "✅ Aplicar pesos y recalcular ranking", type="primary", use_container_width=True
-        )
-    if apply_clicked:
-        st.success("Pesos aplicados. El ranking se ha recalculado con los valores enviados.")
 
-    save_col, reset_col, _ = st.columns([1.2, 1.2, 3])
+    # Copiar la configuración ya aplicada desde otra temporada.
+    other_seasons = [season for season in seasons if season != selected_season]
+    if other_seasons:
+        copy_col, copy_button_col = st.columns([3, 1.5])
+        with copy_col:
+            source_season = st.selectbox(
+                "Copiar pesos desde otra temporada",
+                other_seasons,
+                index=other_seasons.index("2025/26") if "2025/26" in other_seasons else 0,
+                key=f"copy_weights_source_{safe_filename(selected_season)}",
+                help="Copia los pesos de todas las posiciones, estadísticas y competiciones. No copia el ranking."
+            )
+        with copy_button_col:
+            st.markdown(" ")
+            st.button(
+                f"📋 Copiar a {selected_season}",
+                key=f"copy_weights_button_{safe_filename(selected_season)}",
+                on_click=copy_weights_between_seasons,
+                args=(source_season, selected_season, positions, model_stats, competitions),
+                use_container_width=True,
+            )
+        st.caption("Copia la configuración aplicada de origen. Aplica primero cualquier cambio pendiente antes de copiarlo.")
+
+    copied_notice = st.session_state.get("puntuador_weights_copy_notice")
+    if copied_notice and copied_notice[1] == selected_season:
+        st.success(f"Pesos copiados desde {copied_notice[0]} a {selected_season} y guardados automáticamente.")
+    if st.session_state.get("puntuador_weights_applied_notice") == selected_season:
+        st.success(f"Pesos aplicados para {selected_season}; el ranking ya utiliza estos valores.")
+    if st.session_state.get("puntuador_weights_saved_notice"):
+        st.caption(f"Configuraciones guardadas en `{WEIGHTS_PATH}`.")
+    save_error = st.session_state.get("puntuador_weights_save_error", "")
+    if save_error:
+        st.warning(f"No se pudieron guardar automáticamente los pesos en disco: {save_error}. Puedes descargarlos desde la barra lateral.")
+
+    with st.form(f"puntuador_weights_form_{safe_filename(selected_season)}", clear_on_submit=False):
+        position_tabs = st.tabs(positions)
+        configs = st.session_state["puntuador_weight_configs"]
+        season_stat_config = configs["stat_weights_by_season"].get(selected_season, {})
+        season_comp_config = configs["competition_weights_by_season"].get(selected_season, {})
+
+        for position_idx, position in enumerate(positions):
+            with position_tabs[position_idx]:
+                st.markdown(f"### {position}")
+                stats_col, comp_col = st.columns(2)
+                allowed_stats = stats_allowed_for_position(position, model_stats)
+
+                with stats_col:
+                    with st.expander("⚙️ Pesos de las estadísticas", expanded=True):
+                        st.caption("Cada estadística mantiene la orientación fija del modelo original.")
+                        for stat in allowed_stats:
+                            label_col, spin_col = st.columns([2.4, 1])
+                            with label_col:
+                                sign = "−" if stat_sign(stat) < 0 else "+"
+                                st.markdown(f"{sign} {stat}")
+                            with spin_col:
+                                st.number_input(
+                                    f"Peso de {stat}",
+                                    min_value=0.0,
+                                    max_value=10.0,
+                                    step=0.1,
+                                    value=clamp_weight(season_stat_config.get(position, {}).get(stat, 1.0)),
+                                    format="%.1f",
+                                    key=stat_weight_widget_key(selected_season, position, stat),
+                                    label_visibility="collapsed",
+                                    help="Peso entre 0 y 10. Usa los botones + y − para ajustarlo.",
+                                )
+
+                with comp_col:
+                    with st.expander("🏆 Pesos de las competiciones", expanded=True):
+                        st.caption("Cada competición es individual, sin agrupar por categorías.")
+                        for competition in competitions:
+                            label_col, spin_col = st.columns([2.4, 1])
+                            with label_col:
+                                st.markdown(competition)
+                            with spin_col:
+                                st.number_input(
+                                    f"Peso de {competition}",
+                                    min_value=0.0,
+                                    max_value=10.0,
+                                    step=0.1,
+                                    value=clamp_weight(season_comp_config.get(position, {}).get(competition, 1.0)),
+                                    format="%.1f",
+                                    key=competition_weight_widget_key(selected_season, position, competition),
+                                    label_visibility="collapsed",
+                                    help="Peso entre 0 y 10. Usa los botones + y − para ajustarlo.",
+                                )
+
+        st.form_submit_button(
+            "✅ Aplicar pesos y recalcular ranking",
+            type="primary",
+            use_container_width=True,
+            on_click=apply_weight_inputs,
+            args=(selected_season, positions, model_stats, competitions),
+        )
+
+    save_col, reset_col, _ = st.columns([1.5, 1.7, 3])
     with save_col:
-        if st.button("💾 Guardar pesos aplicados", type="secondary", key="save_weights"):
-            latest_stats, latest_comps = current_weight_maps(positions, model_stats, competitions)
-            save_weights(latest_stats, latest_comps)
-            st.success(f"Pesos guardados en `{WEIGHTS_PATH}`. Se conservarán en futuras ejecuciones.")
+        if st.button("💾 Guardar pesos de todas las temporadas", type="secondary", key=f"save_weights_{safe_filename(selected_season)}"):
+            try:
+                save_weight_configs(st.session_state["puntuador_weight_configs"])
+                st.success(f"Configuraciones por temporada guardadas en `{WEIGHTS_PATH}`.")
+            except OSError as exc:
+                st.error(f"No se pudieron guardar los pesos: {exc}")
     with reset_col:
         st.button(
-            "↩ Restablecer a 1",
-            key="reset_weights",
-            on_click=reset_widget_weights,
-            args=(positions, model_stats, competitions),
-            help="Vuelve a poner todos los pesos a 1. No modifica el dataset.",
+            f"↩ Restablecer {selected_season} a 1",
+            key=f"reset_weights_{safe_filename(selected_season)}",
+            on_click=reset_season_weights,
+            args=(selected_season, positions, model_stats, competitions),
+            help="Restablece únicamente la temporada seleccionada. Las demás no cambian.",
+            use_container_width=True,
         )
-    st.caption("Primero aplica los cambios para recalcular el ranking. Después puedes guardar esos pesos para conservar la configuración en el archivo JSON.")
+    st.caption(
+        "Los pesos quedan separados por temporada y se guardan automáticamente al aplicar, copiar o restablecer. "
+        "Al copiar, solo se reemplaza la temporada de destino."
+    )
 
 with compare_tab:
     comparison_tab(dataset, selected_season, ranking, score_detail)
@@ -1196,7 +1305,7 @@ with st.sidebar:
     st.markdown("**Fórmula utilizada**")
     st.latex(r"S_{p,c}=\frac{\sum_s d_s\,z_{p,c,s}\,w_{p,s}}{\sum_s w_{p,s}}\,W_{p,c}")
     st.latex(r"S_p=\sum_c S_{p,c}")
-    st.caption("d = orientación (+1 o −1); z = z-score; w = peso estadístico; W = peso de la competición.")
+    st.caption("d = orientación (+1 o −1); z = z-score; w = peso estadístico; W = peso de la competición. Los pesos se guardan por temporada y posición.")
 
 st.divider()
 st.caption(
