@@ -261,7 +261,7 @@ st.caption(
 
 
 
-# Descripciones breves que aparecen al pasar el cursor por el icono ❔.
+# Definiciones breves para los controles help nativos de Streamlit.
 STAT_HELP = {
     "goals": "Goles marcados por el jugador.",
     "assists": "Asistencias directas que terminan en gol de un compañero.",
@@ -310,28 +310,51 @@ def stat_help(stat: Any) -> str:
     return STAT_HELP.get(key, f"Estadística {key} registrada en el dataset. La definición exacta puede depender del proveedor y de la competición.")
 
 def render_table_with_stat_tooltips(table: pd.DataFrame, stat_column: str = "Estadística", height: int | None = None):
-    """Tabla HTML sencilla para que cada nombre de estadística tenga un icono ❔ con tooltip."""
+    """Muestra el desglose con ayuda nativa de Streamlit en el encabezado de cada estadística."""
     if table.empty:
         st.info("No hay datos para mostrar.")
         return
     if stat_column not in table.columns:
         st.dataframe(table, use_container_width=True, hide_index=True, height=height)
         return
-    headers = "".join(f"<th>{html_escape(str(col))}</th>" for col in table.columns)
-    body_rows = []
-    for row in table.itertuples(index=False, name=None):
-        cells = []
-        for col, value in zip(table.columns, row):
-            if col == stat_column:
-                name = str(value)
-                tip = html_escape(stat_help(name), quote=True)
-                cell = f'<span title="{tip}" style="cursor:help;border-bottom:1px dotted #888">{html_escape(name)}</span> <span title="{tip}" aria-label="Ayuda de {html_escape(name, quote=True)}" style="cursor:help;color:#888;font-weight:700">?</span>'
-            else:
-                cell = html_escape("—" if pd.isna(value) else str(value))
-            cells.append(f"<td>{cell}</td>")
-        body_rows.append("<tr>" + "".join(cells) + "</tr>")
-    html = """<div style="overflow-x:auto;max-width:100%"><table style="width:100%;border-collapse:collapse;font-size:0.9rem"><thead><tr>""" + headers + "</tr></thead><tbody>" + "".join(body_rows) + "</tbody></table></div><style>table th,table td{padding:7px 9px;border-bottom:1px solid rgba(128,128,128,.22);text-align:left}table th{font-weight:650}</style>"
-    st.markdown(html, unsafe_allow_html=True)
+
+    # Streamlit muestra el icono de ayuda por columna, no por fila. Transponemos
+    # el desglose para que cada estadística sea una columna con su propio help.
+    detail = table.copy()
+    detail[stat_column] = detail[stat_column].astype(str)
+    stat_names = detail[stat_column].tolist()
+    value_columns = [column for column in detail.columns if column != stat_column]
+    transposed = detail.set_index(stat_column)[value_columns].T
+    transposed.insert(0, "Dato", value_columns)
+    transposed = transposed.reset_index(drop=True)
+    column_config = {
+        stat: st.column_config.Column(stat, help=stat_help(stat))
+        for stat in stat_names
+    }
+    column_config["Dato"] = st.column_config.TextColumn("Dato")
+    st.dataframe(
+        transposed,
+        use_container_width=True,
+        hide_index=True,
+        height=height,
+        column_config=column_config,
+    )
+
+
+def render_stat_metrics(table: pd.DataFrame, stat_column: str = "Estadística", value_column: str = "Valor"):
+    """Presenta estadísticas individuales como métricas con el help nativo de Streamlit."""
+    if table.empty:
+        st.info("No hay datos para mostrar.")
+        return
+    rows = list(table[[stat_column, value_column]].itertuples(index=False, name=None))
+    for start in range(0, len(rows), 4):
+        metric_columns = st.columns(4)
+        for column, (stat, value) in zip(metric_columns, rows[start:start + 4]):
+            column.metric(
+                label=str(stat),
+                value="—" if pd.isna(value) else str(value),
+                help=stat_help(stat),
+            )
 
 # ============================================================
 # UTILIDADES DE CARGA Y NORMALIZACIÓN
@@ -1096,7 +1119,7 @@ def display_stats_table(rows: pd.DataFrame, title: str, key: str, include_result
         st.info("No hay estadísticas observadas para mostrar.")
         return
     table = pd.DataFrame(table_rows)
-    render_table_with_stat_tooltips(table, stat_column="Estadística", height=min(620, 40 + len(table) * 34))
+    render_stat_metrics(table, stat_column="Estadística", value_column="Valor")
     st.download_button(
         "Descargar estadísticas CSV",
         table.to_csv(index=False).encode("utf-8-sig"),
@@ -1257,12 +1280,23 @@ def comparison_tab(
     chosen_stats = st.multiselect(
         "Estadísticas globales a comparar", available_stats,
         default=recommended or available_stats[:8], key=f"compare_stats_{season}",
-        help="En la tabla, pasa el cursor por el signo ? junto al nombre de cada estadística para ver su definición."
+        help="La definición de cada estadística está disponible en el icono de ayuda de su encabezado en la tabla."
     )
     if chosen_stats:
         st.markdown("#### Comparación global")
-        global_table = comparison[chosen_stats].T.rename_axis("Estadística").reset_index()
-        render_table_with_stat_tooltips(global_table, stat_column="Estadística")
+        global_table = comparison[chosen_stats].reset_index()
+        global_column_config = {"Jugador": st.column_config.TextColumn("Jugador")}
+        for stat in chosen_stats:
+            if stat == "resultado_competicion":
+                global_column_config[stat] = st.column_config.TextColumn(stat, help=stat_help(stat))
+            else:
+                global_column_config[stat] = st.column_config.NumberColumn(stat, help=stat_help(stat))
+        st.dataframe(
+            global_table,
+            use_container_width=True,
+            hide_index=True,
+            column_config=global_column_config,
+        )
         st.download_button(
             "Descargar comparación global CSV", global_table.to_csv(index=False).encode("utf-8-sig"),
             f"comparacion_global_{season.replace('/', '-')}.csv", "text/csv", key=f"cmp_dl_{season}"
@@ -1413,206 +1447,202 @@ st.caption(
 
 stat_weights, competition_weights = weight_configs_for_season(selected_season)
 
-# A diferencia de st.tabs, este selector solo construye la sección activa. Así el
-# comparador no renderiza cientos de tarjetas y controles de pesos en cada cambio.
-section = st.radio(
-    "Sección de la aplicación",
-    ["🏆 Ranking", "⚙️ Pesos por posición", "🔎 Comparador"],
-    horizontal=True,
-    key="puntuador_main_section",
-    label_visibility="collapsed",
+# Pestañas reales con renderizado condicional para no reconstruir controles
+# pesados de las otras secciones en cada cambio de pestaña.
+main_tabs = st.tabs(
+    ["🏆 Ranking", "⚙️ Configurar pesos", "🔎 Comparar"],
+    key="puntuador_main_tabs",
+    on_change="rerun",
 )
-
+ranking_tab, weights_tab, comparator_ui_tab = main_tabs
 ranking = pd.DataFrame()
-if section == "🏆 Ranking":
-    ranking = get_cached_ranking(
-        zdata, selected_season, model_stats, positions,
-        stat_weights, competition_weights, data_signature,
-    )
-    st.subheader(f"Ranking estadístico · {selected_season}")
-    st.write(
-        "La puntuación suma las contribuciones de cada competición. En cada competición, "
-        "los z-scores se multiplican por los pesos de las estadísticas de la posición; "
-        "el total se divide por la suma fija de los pesos estadísticos activos para esa posición "
-        "y se multiplica por el peso de la competición."
-    )
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Jugadores", f"{len(ranking):,}".replace(",", "."))
-    m2.metric("Competiciones", len(competitions))
-    m3.metric("Estadísticas", len(model_stats))
-    d1, d2 = st.columns(2)
-    ranking_csv = ranking.to_csv(index=False).encode("utf-8-sig")
-    d1.download_button(
-        "Descargar ranking CSV", ranking_csv,
-        f"ranking_puntuador_{selected_season.replace('/', '-')}.csv", "text/csv",
-        key=f"dl_ranking_{selected_season}",
-    )
-    export_key = (data_signature, selected_season, weight_signature(stat_weights, competition_weights))
-    export_state = st.session_state.get("puntuador_detail_export", {})
-    if st.button("Preparar desglose completo de contribuciones CSV", key=f"prepare_detail_{safe_filename(selected_season)}"):
-        with st.spinner("Generando el desglose completo..."):
-            _, full_detail = calculate_ranking(
+
+if ranking_tab.open:
+    with ranking_tab:
+            ranking = get_cached_ranking(
                 zdata, selected_season, model_stats, positions,
-                stat_weights, competition_weights, include_detail=True,
+                stat_weights, competition_weights, data_signature,
             )
-            st.session_state["puntuador_detail_export"] = {
-                "key": export_key,
-                "data": full_detail.to_csv(index=False).encode("utf-8-sig") if not full_detail.empty else b"",
-            }
-            export_state = st.session_state["puntuador_detail_export"]
-    if export_state.get("key") == export_key and export_state.get("data") is not None:
-        d2.download_button(
-            "Descargar desglose completo CSV", export_state["data"],
-            f"desglose_puntuador_{selected_season.replace('/', '-')}.csv", "text/csv",
-            key=f"dl_detail_{selected_season}_{export_key[2][:8]}",
+            st.subheader(f"Ranking estadístico · {selected_season}")
+            st.write(
+                "La puntuación suma las contribuciones de cada competición. En cada competición, "
+                "los z-scores se multiplican por los pesos de las estadísticas de la posición; "
+                "el total se divide por la suma fija de los pesos estadísticos activos para esa posición "
+                "y se multiplica por el peso de la competición."
+            )
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Jugadores", f"{len(ranking):,}".replace(",", "."))
+            m2.metric("Competiciones", len(competitions))
+            m3.metric("Estadísticas", len(model_stats))
+            d1, d2 = st.columns(2)
+            ranking_csv = ranking.to_csv(index=False).encode("utf-8-sig")
+            d1.download_button(
+                "Descargar ranking CSV", ranking_csv,
+                f"ranking_puntuador_{selected_season.replace('/', '-')}.csv", "text/csv",
+                key=f"dl_ranking_{selected_season}",
+            )
+            export_key = (data_signature, selected_season, weight_signature(stat_weights, competition_weights))
+            export_state = st.session_state.get("puntuador_detail_export", {})
+            if st.button("Preparar desglose completo de contribuciones CSV", key=f"prepare_detail_{safe_filename(selected_season)}"):
+                with st.spinner("Generando el desglose completo..."):
+                    _, full_detail = calculate_ranking(
+                        zdata, selected_season, model_stats, positions,
+                        stat_weights, competition_weights, include_detail=True,
+                    )
+                    st.session_state["puntuador_detail_export"] = {
+                        "key": export_key,
+                        "data": full_detail.to_csv(index=False).encode("utf-8-sig") if not full_detail.empty else b"",
+                    }
+                    export_state = st.session_state["puntuador_detail_export"]
+            if export_state.get("key") == export_key and export_state.get("data") is not None:
+                d2.download_button(
+                    "Descargar desglose completo CSV", export_state["data"],
+                    f"desglose_puntuador_{selected_season.replace('/', '-')}.csv", "text/csv",
+                    key=f"dl_detail_{selected_season}_{export_key[2][:8]}",
+                )
+            else:
+                d2.caption("El desglose completo se genera solo cuando lo solicitas.")
+
+            if "posicion_real" in ranking.columns and ranking["posicion_real"].notna().any():
+                evaluated = ranking.dropna(subset=["posicion_real"]).copy()
+                if not evaluated.empty:
+                    predicted = evaluated["posicion_predicha"].astype(float)
+                    actual = evaluated["posicion_real"].astype(float)
+                    mae = float(np.mean(np.abs(predicted - actual)))
+                    top5_pred = set(evaluated.nsmallest(5, "posicion_predicha")["nombre"])
+                    top5_real = set(evaluated.nsmallest(5, "posicion_real")["nombre"])
+                    top10_pred = set(evaluated.nsmallest(10, "posicion_predicha")["nombre"])
+                    top10_real = set(evaluated.nsmallest(10, "posicion_real")["nombre"])
+                    a, b, c = st.columns(3)
+                    a.metric("MAE de puesto", f"{mae:.2f}")
+                    b.metric("Coincidencias Top 5", f"{len(top5_pred & top5_real)}/5")
+                    c.metric("Coincidencias Top 10", f"{len(top10_pred & top10_real)}/10")
+                    st.caption("Estas métricas solo se muestran cuando hay puestos reales. No intervienen en la puntuación.")
+
+            show_ranking_cards(
+                ranking, dataset, zdata, selected_season, model_stats,
+                stat_weights, competition_weights, data_signature,
+            )
+
+if weights_tab.open:
+    with weights_tab:
+        st.subheader(f"Pesos de la temporada {selected_season}")
+        st.info(
+            "Cada temporada guarda su propia configuración. Modifica los controles numéricos (+/−) y pulsa "
+            "‘Aplicar pesos’ para guardar los cambios de la posición seleccionada. Los pesos van de 0 a 10, "
+            "la orientación positiva/negativa es fija y cada competición conserva su nombre individual. "
+            "Para no perder cambios, aplica los pesos antes de cambiar de posición o temporada."
         )
-    else:
-        d2.caption("El desglose completo se genera solo cuando lo solicitas.")
 
-    if "posicion_real" in ranking.columns and ranking["posicion_real"].notna().any():
-        evaluated = ranking.dropna(subset=["posicion_real"]).copy()
-        if not evaluated.empty:
-            predicted = evaluated["posicion_predicha"].astype(float)
-            actual = evaluated["posicion_real"].astype(float)
-            mae = float(np.mean(np.abs(predicted - actual)))
-            top5_pred = set(evaluated.nsmallest(5, "posicion_predicha")["nombre"])
-            top5_real = set(evaluated.nsmallest(5, "posicion_real")["nombre"])
-            top10_pred = set(evaluated.nsmallest(10, "posicion_predicha")["nombre"])
-            top10_real = set(evaluated.nsmallest(10, "posicion_real")["nombre"])
-            a, b, c = st.columns(3)
-            a.metric("MAE de puesto", f"{mae:.2f}")
-            b.metric("Coincidencias Top 5", f"{len(top5_pred & top5_real)}/5")
-            c.metric("Coincidencias Top 10", f"{len(top10_pred & top10_real)}/10")
-            st.caption("Estas métricas solo se muestran cuando hay puestos reales. No intervienen en la puntuación.")
+        other_seasons = [season for season in seasons if season != selected_season]
+        if other_seasons:
+            copy_col, copy_button_col = st.columns([3, 1.5])
+            with copy_col:
+                source_season = st.selectbox(
+                    "Copiar pesos de esta temporada", other_seasons,
+                    index=other_seasons.index("2025/26") if "2025/26" in other_seasons else 0,
+                    key=f"copy_weights_source_{safe_filename(selected_season)}",
+                    help="Elige la temporada de origen. Se copian los pesos de todas las posiciones, estadísticas y competiciones.",
+                )
+            with copy_button_col:
+                st.markdown(" ")
+                st.button(
+                    f"📋 Copiar a {selected_season}",
+                    key=f"copy_weights_button_{safe_filename(selected_season)}",
+                    on_click=copy_weights_between_seasons,
+                    args=(source_season, selected_season, positions, model_stats, competitions),
+                    use_container_width=True,
+                )
+            st.caption("Se copia la configuración aplicada de origen. Aplica primero cualquier cambio pendiente.")
 
-    show_ranking_cards(
-        ranking, dataset, zdata, selected_season, model_stats,
-        stat_weights, competition_weights, data_signature,
-    )
+        copied_notice = st.session_state.get("puntuador_weights_copy_notice")
+        if copied_notice and copied_notice[1] == selected_season:
+            st.success(f"Pesos copiados desde {copied_notice[0]} a {selected_season} y guardados automáticamente.")
+        if st.session_state.get("puntuador_weights_applied_notice") == selected_season:
+            st.success(f"Pesos aplicados para {selected_season}; el ranking usará estos valores al abrir la sección Ranking.")
+        if st.session_state.get("puntuador_weights_saved_notice"):
+            st.caption(f"Configuraciones guardadas en `{WEIGHTS_PATH}`.")
+        save_error = st.session_state.get("puntuador_weights_save_error", "")
+        if save_error:
+            st.warning(f"No se pudieron guardar automáticamente los pesos: {save_error}.")
 
-elif section == "⚙️ Pesos por posición":
-    st.subheader(f"Pesos de la temporada {selected_season}")
-    st.info(
-        "Cada temporada guarda su propia configuración. Modifica los controles numéricos (+/−) y pulsa "
-        "‘Aplicar pesos’ para guardar los cambios de la posición seleccionada. Los pesos van de 0 a 10, "
-        "la orientación positiva/negativa es fija y cada competición conserva su nombre individual. "
-        "Para no perder cambios, aplica los pesos antes de cambiar de posición o temporada."
-    )
-
-    other_seasons = [season for season in seasons if season != selected_season]
-    if other_seasons:
-        copy_col, copy_button_col = st.columns([3, 1.5])
-        with copy_col:
-            source_season = st.selectbox(
-                "Copiar pesos de esta temporada", other_seasons,
-                index=other_seasons.index("2025/26") if "2025/26" in other_seasons else 0,
-                key=f"copy_weights_source_{safe_filename(selected_season)}",
-                help="Elige la temporada de origen. Se copian los pesos de todas las posiciones, estadísticas y competiciones.",
+        selected_position = st.selectbox(
+            "Posición cuyos pesos quieres editar", positions,
+            key=f"weight_position_{safe_filename(selected_season)}",
+        )
+        configs = st.session_state["puntuador_weight_configs"]
+        season_stat_config = configs["stat_weights_by_season"].get(selected_season, {})
+        season_comp_config = configs["competition_weights_by_season"].get(selected_season, {})
+        form_key = f"puntuador_weights_form_{safe_filename(selected_season)}_{safe_filename(selected_position)}"
+        with st.form(form_key, clear_on_submit=False):
+            stats_col, comp_col = st.columns(2)
+            allowed_stats = stats_allowed_for_position(selected_position, model_stats)
+            with stats_col:
+                with st.expander("⚙️ Pesos de las estadísticas", expanded=True):
+                    st.caption("Las estadísticas negativas se mantienen negativas; el peso solo controla su magnitud.")
+                    for pair_start in range(0, len(allowed_stats), 2):
+                        stat_columns = st.columns(2)
+                        for stat_column, stat in zip(stat_columns, allowed_stats[pair_start:pair_start + 2]):
+                            sign = "−" if stat_sign(stat) < 0 else "+"
+                            stat_column.number_input(
+                                f"{sign} {stat}", min_value=0.0, max_value=10.0, step=0.1,
+                                value=clamp_weight(season_stat_config.get(selected_position, {}).get(stat, 1.0)),
+                                format="%.1f",
+                                key=stat_weight_widget_key(selected_season, selected_position, stat),
+                                help=f"{stat_help(stat)}\n\nPeso entre 0 y 10. Usa + y − para ajustarlo.",
+                            )
+            with comp_col:
+                with st.expander("🏆 Pesos de las competiciones", expanded=True):
+                    st.caption("Cada competición conserva su nombre y su peso individual.")
+                    for pair_start in range(0, len(competitions), 2):
+                        competition_columns = st.columns(2)
+                        for competition_column, competition in zip(competition_columns, competitions[pair_start:pair_start + 2]):
+                            competition_column.number_input(
+                                competition, min_value=0.0, max_value=10.0, step=0.1,
+                                value=clamp_weight(season_comp_config.get(selected_position, {}).get(competition, 1.0)),
+                                format="%.1f",
+                                key=competition_weight_widget_key(selected_season, selected_position, competition),
+                                help=(
+                                    "Multiplicador de la puntuación aportada por esta competición. "
+                                    "0 excluye su contribución; 1 la deja sin modificar; valores mayores "
+                                    "aumentan su influencia. Los pesos se configuran por posición y temporada."
+                                ),
+                            )
+            st.form_submit_button(
+                f"✅ Aplicar pesos de {selected_position}", type="primary", use_container_width=True,
+                on_click=apply_weight_inputs,
+                args=(selected_season, selected_position, model_stats, competitions),
             )
-        with copy_button_col:
-            st.markdown(" ")
+
+        save_col, reset_col, _ = st.columns([1.5, 1.7, 3])
+        with save_col:
+            if st.button("💾 Guardar pesos de todas las temporadas", type="secondary", key=f"save_weights_{safe_filename(selected_season)}"):
+                try:
+                    save_weight_configs(st.session_state["puntuador_weight_configs"])
+                    st.success(f"Configuraciones por temporada guardadas en `{WEIGHTS_PATH}`.")
+                except OSError as exc:
+                    st.error(f"No se pudieron guardar los pesos: {exc}")
+        with reset_col:
             st.button(
-                f"📋 Copiar a {selected_season}",
-                key=f"copy_weights_button_{safe_filename(selected_season)}",
-                on_click=copy_weights_between_seasons,
-                args=(source_season, selected_season, positions, model_stats, competitions),
+                f"↩ Restablecer {selected_season} a 1",
+                key=f"reset_weights_{safe_filename(selected_season)}",
+                on_click=reset_season_weights,
+                args=(selected_season, positions, model_stats, competitions),
+                help="Restablece únicamente la temporada seleccionada.",
                 use_container_width=True,
             )
-        st.caption("Se copia la configuración aplicada de origen. Aplica primero cualquier cambio pendiente.")
-
-    copied_notice = st.session_state.get("puntuador_weights_copy_notice")
-    if copied_notice and copied_notice[1] == selected_season:
-        st.success(f"Pesos copiados desde {copied_notice[0]} a {selected_season} y guardados automáticamente.")
-    if st.session_state.get("puntuador_weights_applied_notice") == selected_season:
-        st.success(f"Pesos aplicados para {selected_season}; el ranking usará estos valores al abrir la sección Ranking.")
-    if st.session_state.get("puntuador_weights_saved_notice"):
-        st.caption(f"Configuraciones guardadas en `{WEIGHTS_PATH}`.")
-    save_error = st.session_state.get("puntuador_weights_save_error", "")
-    if save_error:
-        st.warning(f"No se pudieron guardar automáticamente los pesos: {save_error}.")
-
-    selected_position = st.selectbox(
-        "Posición cuyos pesos quieres editar", positions,
-        key=f"weight_position_{safe_filename(selected_season)}",
-    )
-    configs = st.session_state["puntuador_weight_configs"]
-    season_stat_config = configs["stat_weights_by_season"].get(selected_season, {})
-    season_comp_config = configs["competition_weights_by_season"].get(selected_season, {})
-    form_key = f"puntuador_weights_form_{safe_filename(selected_season)}_{safe_filename(selected_position)}"
-    with st.form(form_key, clear_on_submit=False):
-        stats_col, comp_col = st.columns(2)
-        allowed_stats = stats_allowed_for_position(selected_position, model_stats)
-        with stats_col:
-            with st.expander("⚙️ Pesos de las estadísticas", expanded=True):
-                st.caption("Las estadísticas negativas se mantienen negativas; el peso solo controla su magnitud.")
-                for stat in allowed_stats:
-                    label_col, spin_col = st.columns([2.4, 1])
-                    with label_col:
-                        sign = "−" if stat_sign(stat) < 0 else "+"
-                        stat_tip = html_escape(stat_help(stat), quote=True)
-                        st.markdown(
-                            f'<span title="{stat_tip}" style="cursor:help">{sign} {html_escape(stat)} <span style="color:#888;font-weight:700">?</span></span>',
-                            unsafe_allow_html=True,
-                        )
-                    with spin_col:
-                        st.number_input(
-                            f"Peso de {stat}", min_value=0.0, max_value=10.0, step=0.1,
-                            value=clamp_weight(season_stat_config.get(selected_position, {}).get(stat, 1.0)),
-                            format="%.1f",
-                            key=stat_weight_widget_key(selected_season, selected_position, stat),
-                            label_visibility="collapsed",
-                            help=f"{stat_help(stat)}\n\nPeso entre 0 y 10. Usa + y − para ajustarlo.",
-                        )
-        with comp_col:
-            with st.expander("🏆 Pesos de las competiciones", expanded=True):
-                st.caption("Cada competición conserva su nombre y su peso individual.")
-                for competition in competitions:
-                    label_col, spin_col = st.columns([2.4, 1])
-                    with label_col:
-                        st.markdown(competition)
-                    with spin_col:
-                        st.number_input(
-                            f"Peso de {competition}", min_value=0.0, max_value=10.0, step=0.1,
-                            value=clamp_weight(season_comp_config.get(selected_position, {}).get(competition, 1.0)),
-                            format="%.1f",
-                            key=competition_weight_widget_key(selected_season, selected_position, competition),
-                            label_visibility="collapsed",
-                            help=f"{stat_help(stat)}\n\nPeso entre 0 y 10. Usa + y − para ajustarlo.",
-                        )
-        st.form_submit_button(
-            f"✅ Aplicar pesos de {selected_position}", type="primary", use_container_width=True,
-            on_click=apply_weight_inputs,
-            args=(selected_season, selected_position, model_stats, competitions),
+        st.caption(
+            "Las configuraciones son independientes por temporada y se guardan en JSON. "
+            "El ranking se recalcula al abrir la pestaña Ranking o Comparar."
         )
 
-    save_col, reset_col, _ = st.columns([1.5, 1.7, 3])
-    with save_col:
-        if st.button("💾 Guardar pesos de todas las temporadas", type="secondary", key=f"save_weights_{safe_filename(selected_season)}"):
-            try:
-                save_weight_configs(st.session_state["puntuador_weight_configs"])
-                st.success(f"Configuraciones por temporada guardadas en `{WEIGHTS_PATH}`.")
-            except OSError as exc:
-                st.error(f"No se pudieron guardar los pesos: {exc}")
-    with reset_col:
-        st.button(
-            f"↩ Restablecer {selected_season} a 1",
-            key=f"reset_weights_{safe_filename(selected_season)}",
-            on_click=reset_season_weights,
-            args=(selected_season, positions, model_stats, competitions),
-            help="Restablece únicamente la temporada seleccionada.",
-            use_container_width=True,
+if comparator_ui_tab.open:
+    with comparator_ui_tab:
+        ranking = get_cached_ranking(
+            zdata, selected_season, model_stats, positions,
+            stat_weights, competition_weights, data_signature,
         )
-    st.caption(
-        "Las configuraciones son independientes por temporada y se guardan en JSON. "
-        "El ranking solo se recalcula cuando abres la sección Ranking o Comparador."
-    )
-
-else:
-    ranking = get_cached_ranking(
-        zdata, selected_season, model_stats, positions,
-        stat_weights, competition_weights, data_signature,
-    )
-    comparison_tab(dataset, player_comp, selected_season, ranking)
+        comparison_tab(dataset, player_comp, selected_season, ranking)
 
 with st.sidebar:
     st.header("Archivos")
