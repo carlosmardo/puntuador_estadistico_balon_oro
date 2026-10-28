@@ -213,6 +213,51 @@ DISPLAY_EXTRA_STATS = [
     "goals", "assists", "appearances", "minutesPlayed",
 ]
 
+# Glosario mostrado al pasar el cursor por el icono «?» de cada estadística.
+# Las definiciones siguen las descripciones proporcionadas para este proyecto.
+STAT_DESCRIPTIONS = {
+    "keyPasses": "Pases clave: pase final de un jugador que termina directamente en un disparo de un compañero. El tiro puede ir fuera, al poste, ser detenido por el portero o acabar en gol. Mide la visión para generar un remate.",
+    "totalAttemptAssist": "Asistencias de remate totales: en la terminología de Opta, engloba los pases que asisten a un intento de gol. En la práctica, suele correlacionarse mucho con keyPasses, pero registra la acción del pasador en jugadas que producen un remate, incluidos saques de esquina o faltas que terminan en tiro.",
+    "bigChancesCreated": "Grandes ocasiones creadas: pases que dejan a un compañero en una situación muy clara de gol, como un mano a mano con el portero, un pase de la muerte o una ocasión para empujar el balón a la red. No todo pase que acaba en disparo cuenta como gran ocasión.",
+    "accuratePasses": "Pases precisos: cantidad total de pases —cortos, largos o centros— que el jugador completa con éxito.",
+    "accuratePassesPercentage": "Porcentaje de pases precisos: (pases acertados / pases totales intentados) × 100. Mide la precisión relativa. Un centrocampista defensivo que arriesga poco puede alcanzar un 95 %, mientras que un jugador creativo que intenta pases más difíciles puede tener un 75 %.",
+    "goalsAssistsSum": "Suma de goles y asistencias: suma acumulada de los goles anotados y las asistencias directas de gol del jugador.",
+    "bigChancesMissed": "Grandes ocasiones falladas: oportunidades muy claras de gol que el propio jugador no convierte, como penaltis, mano a mano o remates a puerta vacía; el tiro puede ir fuera, al palo o ser detenido.",
+    "goalConversionPercentage": "Porcentaje de conversión de goles: (goles marcados / tiros totales realizados) × 100. Por ejemplo, un gol en diez tiros equivale al 10 %; un gol en dos tiros equivale al 50 %.",
+    "successfulDribbles": "Regates con éxito: veces que el jugador supera activamente a un defensor mediante una filigrana, amago o cambio de ritmo y conserva la posesión tras la acción.",
+    "successfulDribblesPercentage": "Porcentaje de regates con éxito: regates completados divididos entre regates intentados, multiplicado por 100. Mide la eficacia en el uno contra uno ofensivo.",
+    "totalDuelsWon": "Total de duelos ganados: suma de las disputas uno contra uno en el suelo y en el aire. Incluye duelos ofensivos ganados, duelos defensivos ganados y disputas físicas por la posesión.",
+    "totalDuelsWonPercentage": "Porcentaje total de duelos ganados: (duelos ganados / duelos totales) × 100. Indica la proporción de disputas que gana el jugador; superar el 60 % puede señalar una actuación dominante en los duelos.",
+    "aerialDuelsWon": "Duelos aéreos ganados: disputas ganadas por el balón cuando está en el aire, normalmente mediante un salto o un cabezazo.",
+    "aerialDuelsWonPercentage": "Porcentaje de duelos aéreos ganados: duelos aéreos ganados divididos entre los duelos aéreos disputados, multiplicado por 100. Ayuda a valorar el rendimiento en el juego aéreo.",
+    "tacklesWon": "Entradas ganadas: acciones en las que el rival controla el balón y el jugador mete el pie o se lanza al suelo para quitárselo limpiamente o cortar el avance.",
+    "tacklesWonPercentage": "Porcentaje de entradas ganadas: mide cuántas veces el jugador consigue ganar la entrada frente a las ocasiones en que es superado o comete falta en el intento, según la definición registrada por la fuente.",
+    "interceptions": "Intercepciones: acciones en las que el rival realiza un pase y el jugador lee la jugada, se cruza en la trayectoria y corta el pase. Refleja anticipación y colocación.",
+    "ballRecovery": "Recuperaciones de balón: ocasiones en las que el jugador recoge un balón suelto —por ejemplo, tras un mal control, un despeje defectuoso o un pase impreciso— y devuelve la posesión a su equipo, sin que necesariamente exista un robo directo.",
+    "possessionWonAttThird": "Posesiones ganadas en el tercio de ataque: robos, intercepciones o recuperaciones que el jugador consigue en la zona más cercana al área rival, asociada a la presión alta.",
+    "outfielderBlocks": "Bloqueos de jugador de campo: acciones en las que un jugador que no es el portero interpone su cuerpo para frenar un disparo o centro peligroso del rival.",
+    "clearances": "Despejes: acción defensiva en la que el jugador patea o cabecea el balón lejos de su propia área de peligro. El objetivo es eliminar la amenaza, no necesariamente realizar un pase preciso.",
+    "dispossessed": "Desposeído: ocurre cuando el jugador lleva el balón controlado y un defensor se lo quita mediante una entrada limpia. No cuenta un mal pase.",
+    "dribbledPast": "Regateado: indica cuántas veces un rival encara al jugador y lo supera mediante un regate. Es un indicador negativo directo para valorar el rendimiento defensivo.",
+    "errorLeadToShot": "Error que lleva a disparo: fallo técnico claro —por ejemplo, un mal pase atrás o una recepción fallida— que regala el balón al rival y provoca un disparo a portería.",
+    "errorLeadToGoal": "Error que lleva a gol: fallo técnico que regala el balón al rival y termina directamente en un gol encajado. Es una acción especialmente perjudicial.",
+    "ownGoals": "Goles en propia puerta: goles que el jugador introduce accidentalmente en su propia portería.",
+    "penaltyConceded": "Penalti cometido: acción del jugador —como una falta o mano— sancionada con un penalti a favor del rival dentro del área propia.",
+    "saves": "Paradas: acciones del portero que evitan que el balón entre en la portería, con las manos, los pies o cualquier parte del cuerpo.",
+    "goalsPrevented": "Goles evitados: diferencia entre los goles esperados a puerta (xGoT) de los tiros recibidos y los goles que realmente encaja el portero. Un valor positivo indica que ha evitado más goles de los esperados.",
+    "goalsConceded": "Goles encajados: número de goles recibidos por el equipo mientras el portero participa en el partido, según los datos de la fuente.",
+    "highClaims": "Balones aéreos blocados: ocasiones en las que el portero sale a cortar un centro alto y atrapa firmemente el balón, terminando la jugada rival.",
+    "punches": "Despejes de puños: ocasiones en las que el portero desvía un centro golpeando el balón con los puños en vez de blocarlo.",
+    "successfulRunsOut": "Salidas con éxito: cuando el portero abandona el área para actuar como portero-líbero y llega antes que el delantero rival a un pase largo al espacio.",
+    "cleanSheet": "Portería a cero: se concede al portero y a los defensas si el equipo no recibe goles durante el periodo de participación que contempla la fuente, sujeto al mínimo de minutos requerido por la competición.",
+    "goals": "Goles: número de goles marcados por el jugador en la competición o periodo mostrado.",
+    "assists": "Asistencias: pases o acciones acreditadas como asistencia directa de un gol, según la fuente de datos.",
+    "appearances": "Apariciones: número de partidos en los que el jugador ha participado, según la fuente de datos.",
+    "minutesPlayed": "Minutos jugados: suma de los minutos disputados por el jugador en la competición o periodo mostrado.",
+    "goalsAssistsPerMins": "Goles y asistencias por minuto: suma de goles y asistencias dividida entre los minutos jugados. En esta aplicación se expresa como ratio por minuto, no por cada 90 minutos.",
+    "resultado_competicion": "Resultado de la competición: fase o puesto final alcanzado por el equipo del jugador, por ejemplo ganador, finalista, semifinales o cuartos de final. En la puntuación se convierte a una escala ordinal fija.",
+}
+
 IDENTITY_COLUMNS = [
     "temporada", "nombre", "club", "posicion", "nacionalidad",
     "id_sofascore", "posicion_balon_oro", "dataset",
@@ -243,6 +288,20 @@ st.markdown(
         border-top:1px solid rgba(128,128,128,.16);
       }
       .ranking-metric strong {display:block; margin-top:2px; font-size:.9rem; overflow-wrap:anywhere;}
+      .stat-help {
+        display:inline-flex; align-items:center; justify-content:center;
+        width:16px; height:16px; margin-left:5px; border-radius:50%;
+        border:1px solid rgba(128,128,128,.72); font-size:11px; line-height:1;
+        font-weight:750; cursor:help; vertical-align:middle; opacity:.9;
+      }
+      .help-table-wrap {width:100%; overflow-x:auto; margin:.25rem 0 .65rem 0;}
+      table.help-stats-table {border-collapse:collapse; width:100%; font-size:.9rem;}
+      table.help-stats-table th, table.help-stats-table td {
+        padding:8px 10px; text-align:left; border-bottom:1px solid rgba(128,128,128,.2);
+        vertical-align:top; white-space:normal;
+      }
+      table.help-stats-table th {font-weight:650; background:rgba(128,128,128,.08);}
+      table.help-stats-table td:first-child {min-width:190px; font-weight:500;}
       @media(max-width:700px) {
         .ranking-card-top {grid-template-columns:40px minmax(0,1fr) 85px; gap:8px;}
         .ranking-real-position {display:none;}
@@ -1007,6 +1066,60 @@ def format_value(value: Any) -> str:
     return str(value)
 
 
+def stat_description(stat: Any) -> str:
+    """Devuelve la definición de una estadística para el tooltip «?»."""
+    name = str(stat)
+    return STAT_DESCRIPTIONS.get(
+        name,
+        f"{name}: indicador estadístico recogido en el dataset para comparar el rendimiento del jugador. "
+        "Consulta la definición de la fuente original para los criterios exactos de registro.",
+    )
+
+
+def stat_label_html(stat: Any, prefix: str = "") -> str:
+    """Etiqueta HTML con un icono de ayuda «?» accesible mediante hover."""
+    name = str(stat)
+    safe_name = html_escape(name)
+    safe_prefix = html_escape(prefix)
+    description = html_escape(stat_description(name), quote=True)
+    return (
+        f'<span class="stat-label">{safe_prefix}{safe_name}'
+        f'<span class="stat-help" title="{description}" aria-label="Ayuda sobre {safe_name}">?</span>'
+        '</span>'
+    )
+
+
+def render_help_table(table: pd.DataFrame, stat_column: str = "Estadística") -> None:
+    """Renderiza una tabla HTML con «?» contextual en cada fila de estadística."""
+    if table is None or table.empty:
+        st.info("No hay datos para mostrar.")
+        return
+    columns = [str(column) for column in table.columns]
+    pieces = [
+        '<div class="help-table-wrap"><table class="help-stats-table"><thead><tr>'
+    ]
+    for column in columns:
+        pieces.append(f'<th>{html_escape(column)}</th>')
+    pieces.append('</tr></thead><tbody>')
+    for row in table.itertuples(index=False, name=None):
+        pieces.append('<tr>')
+        for column, value in zip(columns, row):
+            if pd.isna(value):
+                shown = "—"
+            elif isinstance(value, (float, np.floating, int, np.integer)) and not isinstance(value, (bool, np.bool_)):
+                shown = format_value(value)
+            else:
+                shown = str(value)
+            if column == stat_column:
+                cell_html = stat_label_html(shown)
+            else:
+                cell_html = html_escape(shown)
+            pieces.append(f'<td>{cell_html}</td>')
+        pieces.append('</tr>')
+    pieces.append('</tbody></table></div>')
+    st.markdown(''.join(pieces), unsafe_allow_html=True)
+
+
 def display_stats_table(rows: pd.DataFrame, title: str, key: str, include_result: bool = True):
     vals = aggregate_display_stats(rows)
     table_rows = []
@@ -1023,7 +1136,7 @@ def display_stats_table(rows: pd.DataFrame, title: str, key: str, include_result
         st.info("No hay estadísticas observadas para mostrar.")
         return
     table = pd.DataFrame(table_rows)
-    st.dataframe(table, use_container_width=True, hide_index=True, height=min(620, 40 + len(table) * 34))
+    render_help_table(table, stat_column="Estadística")
     st.download_button(
         "Descargar estadísticas CSV",
         table.to_csv(index=False).encode("utf-8-sig"),
@@ -1062,7 +1175,7 @@ def show_player_detail(raw_df: pd.DataFrame, season: str, name: str, detail_df: 
                     "orientacion": "Orientación", "peso_estadistica": "Peso estadístico",
                     "contribucion_final": "Contribución final",
                 })
-                st.dataframe(shown, use_container_width=True, hide_index=True)
+                render_help_table(shown, stat_column="Estadística")
 
 
 def toggle_player_profile(season: str, player_key: str) -> None:
@@ -1183,12 +1296,13 @@ def comparison_tab(
     recommended = [s for s in ["goals", "assists", "goalsAssistsSum", "minutesPlayed", "appearances", "goalConversionPercentage", "accuratePassesPercentage", "resultado_competicion"] if s in available_stats]
     chosen_stats = st.multiselect(
         "Estadísticas globales a comparar", available_stats,
-        default=recommended or available_stats[:8], key=f"compare_stats_{season}"
+        default=recommended or available_stats[:8], key=f"compare_stats_{season}",
+        help="Cada estadística seleccionada aparece en la tabla con un icono «?»; pasa el cursor por él para consultar su definición."
     )
     if chosen_stats:
         st.markdown("#### Comparación global")
         global_table = comparison[chosen_stats].T.rename_axis("Estadística").reset_index()
-        st.dataframe(global_table, use_container_width=True, hide_index=True)
+        render_help_table(global_table, stat_column="Estadística")
         st.download_button(
             "Descargar comparación global CSV", global_table.to_csv(index=False).encode("utf-8-sig"),
             f"comparacion_global_{season.replace('/', '-')}.csv", "text/csv", key=f"cmp_dl_{season}"
@@ -1217,7 +1331,8 @@ def comparison_tab(
                         item[stat] = vals.get(stat, np.nan)
                 comp_result.append(item)
             if comp_result:
-                st.dataframe(pd.DataFrame(comp_result), use_container_width=True, hide_index=True)
+                comp_table = pd.DataFrame(comp_result).set_index("Jugador")[chosen_stats].T.rename_axis("Estadística").reset_index()
+                render_help_table(comp_table, stat_column="Estadística")
             else:
                 st.caption("Ninguno de los jugadores seleccionados tiene datos en esta competición.")
 
@@ -1466,7 +1581,7 @@ elif section == "⚙️ Pesos por posición":
                     label_col, spin_col = st.columns([2.4, 1])
                     with label_col:
                         sign = "−" if stat_sign(stat) < 0 else "+"
-                        st.markdown(f"{sign} {stat}")
+                        st.markdown(stat_label_html(stat, prefix=f"{sign} "), unsafe_allow_html=True)
                     with spin_col:
                         st.number_input(
                             f"Peso de {stat}", min_value=0.0, max_value=10.0, step=0.1,
